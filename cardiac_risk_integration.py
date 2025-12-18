@@ -26,6 +26,57 @@ from score_based_risk import ScoreBasedRiskExtractor
 from procedure_event_risk import ProcedureEventRiskExtractor
 from trend_risk_flags import generate_trend_risk_flags
 from temporal_narrative import generate_temporal_narrative
+from hepatic_risk_calculators import VocalPennInputs, calculate_vocal_penn
+from comorbidity_blocks import (
+    PatientClinicalData,
+    ProblemListItem,
+    MedicationItem,
+    LabValues,
+    VitalSigns,
+    BloodPressure,
+    Demographics,
+    HpiRedFlags,
+    ComorbidityBlockDefinition,
+    TriggerEvaluationResult,
+    PersonalizedContent,
+    MergedContent,
+    ClinicalRecommendations,
+    ConsultationRecommendation,
+    MonitoringRequirement,
+    MedicationAdjustment,
+    evaluate_trigger,
+    assess_risk_level,
+    get_risk_specific_recommendations,
+    generate_personalized_content,
+    merge_blocks,
+    generate_recommendations,
+    get_all_comorbidity_blocks,
+    calculate_egfr_ckd_epi,
+)
+from clinical_change_detector import (
+    SurgeryAwareChangeDetector,
+    LabTrendInput,
+    LabValuePoint,
+    NormalRange,
+    ChangeAnalysis,
+    AnalysisWindow,
+    ChangeAnalysisMetrics,
+    generate_change_summary,
+    detect_clinical_patterns,
+    convert_trend_to_changes,
+    enhance_with_temporal_features,
+    LabValueSeries,
+    ChangeType,
+    ChangeCategory,
+    ClinicalImpact,
+    RiskChange,
+    QuantitativeData,
+    ClinicalChange,
+    TemporalFeatures,
+    IntegratedTrend,
+)
+# Import private functions using importlib or access via module
+import clinical_change_detector as ccd_module
 
 
 def _build_cardiac_consensus(scores: Dict[str, Any]) -> str:
@@ -578,6 +629,316 @@ def _calculate_rcri_fraction(components: Dict[str, Any], insulin_therapy: Option
     return f"{count}/{total_components}"
 
 
+def _build_patient_clinical_data(
+    pulm_extractor: PulmonaryRiskExtractor,
+    cardiac_extractor: ScoreBasedRiskExtractor,
+    proc_extractor: ProcedureEventRiskExtractor,
+    subject_id: int,
+    hadm_id: int,
+    cardiac_report: Dict[str, Any],
+    enhanced_pulm: Dict[str, Any],
+    recent_vital_signs: Dict[str, Any],
+    hpi_red_flags: Dict[str, Any],
+) -> PatientClinicalData:
+    """
+    Build PatientClinicalData from extracted MIMIC-III data.
+    
+    This function aggregates data from multiple extractors into a unified
+    PatientClinicalData structure for comorbidity block evaluation.
+    """
+    # Extract problem list (diagnoses)
+    problem_list: List[ProblemListItem] = []
+    if pulm_extractor.diagnoses_icd_df is not None and pulm_extractor.d_icd_diagnoses_df is not None:
+        diagnoses = pulm_extractor.diagnoses_icd_df[
+            (pulm_extractor.diagnoses_icd_df['SUBJECT_ID'] == subject_id) &
+            (pulm_extractor.diagnoses_icd_df['HADM_ID'] == hadm_id)
+        ]
+        if not diagnoses.empty:
+            code_col = pulm_extractor.icd_code_column or 'ICD9_CODE'
+            if code_col in diagnoses.columns:
+                for _, row in diagnoses.iterrows():
+                    code = str(row[code_col])
+                    name = row.get('LONG_TITLE', code) if 'LONG_TITLE' in row else code
+                    date = str(row.get('CHARTDATE', '')) if 'CHARTDATE' in row else ''
+                    problem_list.append(ProblemListItem(code=code, name=name, date=date))
+    
+    # Extract medications (placeholder - MIMIC-III doesn't have structured medication data)
+    # In real implementation, this would come from PRESCRIPTIONS or INPUTEVENTS_MV
+    medications: List[MedicationItem] = []
+    # TODO: Extract from prescriptions table if available
+    
+    # Extract lab values
+    cardiac_labs = cardiac_report.get("labs", {}) or {}
+    pulm_labs = enhanced_pulm.get("lab_risk", {}) or {}
+    lab_values = LabValues(
+        hemoglobin=pulm_labs.get("hgb") or cardiac_labs.get("anemia", {}).get("hgb_last"),
+        a1c=None,  # Not extracted in current implementation
+        creatinine=cardiac_labs.get("creatinine", {}).get("last"),
+        albumin=pulm_labs.get("albumin"),
+        inr=None,  # Not extracted in current implementation
+        platelets=None,  # Not extracted in current implementation
+        bilirubin=None,  # Not extracted in current implementation
+        sodium=cardiac_labs.get("electrolytes", {}).get("na"),
+        bnp=cardiac_labs.get("bnp", {}).get("last") or pulm_labs.get("bnp"),
+        troponin=cardiac_labs.get("troponin", {}).get("last"),
+        nt_probnp=None,  # Not extracted in current implementation
+        ferritin=None,  # Not extracted in current implementation
+        tsat=None,  # Not extracted in current implementation
+    )
+    
+    # Extract vital signs
+    bp = None
+    if recent_vital_signs.get("blood_pressure"):
+        bp_data = recent_vital_signs["blood_pressure"]
+        bp = BloodPressure(
+            systolic=bp_data.get("systolic"),
+            diastolic=bp_data.get("diastolic"),
+        )
+    vitals = VitalSigns(
+        heartRate=recent_vital_signs.get("heart_rate"),
+        bloodPressure=bp,
+        spo2=recent_vital_signs.get("spo2") or enhanced_pulm.get("preop_spo2"),
+        temperature=recent_vital_signs.get("temperature"),
+    )
+    
+    # Extract devices (placeholder - would come from device-specific tables)
+    devices: List[str] = []
+    # Check for pacemaker/ICD from diagnoses or procedures
+    if pulm_extractor.diagnoses_icd_df is not None:
+        device_diag = pulm_extractor.diagnoses_icd_df[
+            (pulm_extractor.diagnoses_icd_df['SUBJECT_ID'] == subject_id) &
+            (pulm_extractor.diagnoses_icd_df['HADM_ID'] == hadm_id)
+        ]
+        if not device_diag.empty:
+            code_col = pulm_extractor.icd_code_column or 'ICD9_CODE'
+            if code_col in device_diag.columns:
+                codes = device_diag[code_col].astype(str).str.lower()
+                if codes.str.contains('pacemaker|icd|implantable', case=False, na=False).any():
+                    devices.append('pacemaker')
+                    devices.append('ICD')
+    
+    # Extract demographics
+    age = None
+    sex = None
+    bmi = None
+    if pulm_extractor.patients_df is not None:
+        patient = pulm_extractor.patients_df[pulm_extractor.patients_df['SUBJECT_ID'] == subject_id]
+        if not patient.empty:
+            sex = patient['GENDER'].iloc[0] if 'GENDER' in patient.columns else None
+    if pulm_extractor.admissions_df is not None:
+        adm = pulm_extractor.admissions_df[pulm_extractor.admissions_df['HADM_ID'] == hadm_id]
+        if not adm.empty and pulm_extractor.patients_df is not None:
+            patient = pulm_extractor.patients_df[pulm_extractor.patients_df['SUBJECT_ID'] == subject_id]
+            if not patient.empty:
+                dob = pd.to_datetime(patient['DOB'].iloc[0])
+                admittime = pd.to_datetime(adm['ADMITTIME'].iloc[0])
+                age = int((admittime - dob).days / 365.25)
+    
+    demographics = Demographics(
+        age=age,
+        sex=sex,
+        bmi=bmi,
+        smokingStatus=None,  # Would need to extract from chartevents/noteevents
+    )
+    
+    # Extract HPI red flags
+    hpi_flags = HpiRedFlags(
+        chestPain=hpi_red_flags.get("chestPain", {}).get("present", False),
+        shortnessOfBreath=hpi_red_flags.get("shortnessOfBreath", {}).get("present", False),
+        syncope=False,  # Not extracted in current implementation
+        fever=False,  # Not extracted in current implementation
+    )
+    
+    return PatientClinicalData(
+        problemList=problem_list,
+        medications=medications,
+        labs=lab_values,
+        vitals=vitals,
+        devices=devices,
+        demographics=demographics,
+        hpiRedFlags=hpi_flags,
+        # Risk stratification fields (defaults - would be populated from EHR in production)
+        lvef=None,  # Would come from echocardiogram reports
+        nyha_class=None,  # Would come from clinical notes/problem list
+        dasi_mets=None,  # Would come from functional capacity assessment
+        recent_cardiac_event_months=None,  # Would be calculated from problem list dates
+        inotropic_dependence=False,  # Would come from medication list
+        proteinuria=None,  # Would come from urinalysis results
+        dialysis_dependent=False,  # Would come from problem list/devices
+        diabetes_complications=[],  # Would come from problem list
+        recurrent_hypoglycemia=False,  # Would come from clinical notes
+    )
+
+
+def _evaluate_comorbidity_blocks(
+    patient_clinical_data: PatientClinicalData,
+    surg_ctx: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Evaluate all configured comorbidity blocks against patient clinical data.
+    
+    Returns a list of TriggerEvaluationResult dictionaries (serialized for JSON).
+    """
+    results: List[Dict[str, Any]] = []
+    
+    # Get all configured comorbidity blocks
+    blocks = get_all_comorbidity_blocks()
+    
+    # Special handling for CKD block: calculate eGFR if creatinine available
+    # This needs to be done before evaluation since eGFR is not directly in LabValues
+    # We'll handle this in the evaluation by checking eGFR thresholds
+    
+    for block in blocks:
+        evaluation_result = evaluate_trigger(block, patient_clinical_data)
+        
+        # Special handling for CKD: check eGFR threshold
+        if block.blockId == "CKD_001":
+            egfr = calculate_egfr_ckd_epi(
+                creatinine=patient_clinical_data.labs.creatinine,
+                age=patient_clinical_data.demographics.age,
+                sex=patient_clinical_data.demographics.sex,
+            )
+            if egfr is not None and egfr < 60:
+                # Add eGFR trigger if not already triggered
+                if not evaluation_result.triggered:
+                    evaluation_result = TriggerEvaluationResult(
+                        blockId=evaluation_result.blockId,
+                        triggered=True,
+                        triggerReasons=[f"eGFR < 60: {egfr:.1f} mL/min/1.73m²"],
+                        confidenceScore=0.8,
+                        riskLevel="intermediate",
+                        requiredActions=list(evaluation_result.requiredActions),
+                    )
+                elif "eGFR" not in str(evaluation_result.triggerReasons):
+                    # Add to existing reasons
+                    new_reasons = list(evaluation_result.triggerReasons)
+                    new_reasons.append(f"eGFR < 60: {egfr:.1f} mL/min/1.73m²")
+                    evaluation_result = TriggerEvaluationResult(
+                        blockId=evaluation_result.blockId,
+                        triggered=True,
+                        triggerReasons=new_reasons,
+                        confidenceScore=min(1.0, evaluation_result.confidenceScore + 0.1),
+                        riskLevel=evaluation_result.riskLevel,
+                        requiredActions=list(evaluation_result.requiredActions),
+                    )
+        
+        # Apply risk stratification if block is triggered
+        refined_risk_level = evaluation_result.riskLevel
+        personalized_content = None
+        
+        if evaluation_result.triggered:
+            refined_risk_level = assess_risk_level(block, patient_clinical_data, evaluation_result)
+            risk_specific_recommendations = get_risk_specific_recommendations(block, refined_risk_level)
+            
+            # Determine procedure bleed risk (simplified - would come from procedure chips in production)
+            procedure_bleed_risk = _infer_procedure_bleed_risk(surg_ctx)
+            
+            # Generate personalized content
+            personalized_content = generate_personalized_content(
+                block=block,
+                patient_data=patient_clinical_data,
+                risk_level=refined_risk_level,
+                confidence_tier=evaluation_result.confidenceTier,
+                procedure_bleed_risk=procedure_bleed_risk,
+            )
+            
+            # Update evaluation result with refined risk level
+            evaluation_result = TriggerEvaluationResult(
+                blockId=evaluation_result.blockId,
+                triggered=evaluation_result.triggered,
+                triggerReasons=evaluation_result.triggerReasons,
+                confidenceScore=evaluation_result.confidenceScore,
+                riskLevel=refined_risk_level,
+                requiredActions=evaluation_result.requiredActions + risk_specific_recommendations,
+            )
+        
+        # Serialize to dictionary for JSON output
+        result_dict = {
+            "blockId": evaluation_result.blockId,
+            "conditionName": block.conditionName,
+            "triggered": evaluation_result.triggered,
+            "triggerReasons": evaluation_result.triggerReasons,
+            "confidenceScore": round(evaluation_result.confidenceScore, 3),
+            "confidenceTier": evaluation_result.confidenceTier,
+            "confidenceFlag": evaluation_result.confidenceFlag,
+            "riskLevel": refined_risk_level,
+            "requiredActions": evaluation_result.requiredActions,  # Backward compatibility
+            "categorizedActions": {
+                "requiredActions": evaluation_result.categorizedActions.requiredActions,
+                "suggestedActions": evaluation_result.categorizedActions.suggestedActions,
+                "optionalActions": evaluation_result.categorizedActions.optionalActions,
+            },
+            "exportStatus": {
+                "exportAllowed": evaluation_result.exportAllowed,
+                "exportWarning": evaluation_result.exportWarning,
+                "exportNote": evaluation_result.exportNote,
+            },
+            "contentSections": {
+                "why": block.contentSections.why,
+                "whatToCheck": block.contentSections.whatToCheck,
+                "preOpActions": block.contentSections.preOpActions,
+                "intraOpConsiderations": block.contentSections.intraOpConsiderations,
+                "postOpManagement": block.contentSections.postOpManagement,
+                "anesthesiaHeadsUp": block.contentSections.anesthesiaHeadsUp,
+                "references": block.contentSections.references,
+            },
+            "version": block.version,
+        }
+        
+        # Add personalized content if available
+        if personalized_content:
+            result_dict["personalizedContent"] = {
+                "baseContent": personalized_content.baseContent,
+                "personalizedRecommendations": personalized_content.personalizedRecommendations,
+                "fullContent": personalized_content.fullContent,
+                "versionFooter": personalized_content.versionFooter,
+            }
+        
+        results.append(result_dict)
+    
+    return results
+
+
+def _infer_procedure_bleed_risk(surg_ctx: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Infer procedure bleed risk from surgery context.
+    In production, this would come from Barnabus procedure chips.
+    
+    Args:
+        surg_ctx: Surgery context dictionary
+    
+    Returns:
+        'low', 'moderate', 'high', or None
+    """
+    if not surg_ctx:
+        return None
+    
+    surgery_type = surg_ctx.get("planned_surgery_type", "").lower()
+    procedure_name = surg_ctx.get("primary_procedure_name", "").lower()
+    
+    # High bleed risk procedures
+    high_bleed_keywords = [
+        'cardiac', 'vascular', 'major abdominal', 'liver', 'spleen',
+        'prostate', 'bladder', 'kidney', 'neurosurgery', 'spine',
+        'orthopedic major', 'joint replacement'
+    ]
+    
+    # Low bleed risk procedures
+    low_bleed_keywords = [
+        'cataract', 'endoscopy', 'colonoscopy', 'minor', 'superficial',
+        'dermatology', 'ophthalmology'
+    ]
+    
+    combined_text = f"{surgery_type} {procedure_name}"
+    
+    if any(keyword in combined_text for keyword in high_bleed_keywords):
+        return 'high'
+    elif any(keyword in combined_text for keyword in low_bleed_keywords):
+        return 'low'
+    else:
+        return 'moderate'  # Default to moderate if unclear
+
+
 def _collect_assumptions() -> List[str]:
     """
     Static list of key assumptions/heuristics used across risk modules.
@@ -657,38 +1018,101 @@ def integrate_cardiac_and_pulmonary_risk(
     )
 
     # ---------------- calculated_risk_factors ----------------
-    # Extract ARISCAT information
-    ariscat = enhanced_pulm.get("ariscat", {})
+    # Extract ARISCAT information (Barnabus-compatible)
+    ariscat = enhanced_pulm.get("ariscat", {}) or {}
     ariscat_score = ariscat.get("score") or ariscat.get("ariscat_score")
-    ariscat_cat = ariscat.get("risk_category") or ariscat.get("risk_level")
+    ariscat_cat_raw = (ariscat.get("risk_category") or ariscat.get("risk_level") or "") or None
+    # Normalize ARISCAT risk category to Barnabus-style title case
+    if ariscat_cat_raw:
+        cat_lower = str(ariscat_cat_raw).lower()
+        if cat_lower in {"low", "intermediate", "moderate"}:
+            ariscat_cat = "Low" if cat_lower == "low" else ("Intermediate" if cat_lower in {"intermediate", "moderate"} else "High")
+        elif cat_lower in {"high"}:
+            ariscat_cat = "High"
+        else:
+            ariscat_cat = None
+    else:
+        ariscat_cat = None
     pulm_overall_cat = enhanced_pulm.get("overall_risk_category")
     
-    # Extract ARISCAT component flags from risk_factors
-    ariscat_flags = {}
+    # Extract ARISCAT component flags and effective input values from risk_factors
+    ariscat_flags: Dict[str, Any] = {}
+    ariscat_effective_inputs: Dict[str, Any] = {}
+    ariscat_missing_inputs: List[str] = []
     if pulmonary_risk_factors:
+        # Core effective inputs
+        age_at_surg = pulmonary_risk_factors.get("age_at_surgery")
+        preop_spo2 = pulmonary_risk_factors.get("preop_spo2")
+        preop_hgb = pulmonary_risk_factors.get("preop_hgb")
+        surg_details = pulmonary_risk_factors.get("surgery_details") or {}
+        incision_site_raw = surg_details.get("incision_site")
+        duration_min = surg_details.get("surgery_duration_minutes")
+        emergency = surg_details.get("emergency_status")
+
+        # Map incision site to ARISCAT categories
+        if incision_site_raw in {"upper_abdominal"}:
+            surgical_site_cat = "upper_abdominal"
+        elif incision_site_raw in {"thoracic", "intrathoracic"}:
+            surgical_site_cat = "intrathoracic"
+        else:
+            surgical_site_cat = "peripheral"
+
+        duration_hours = duration_min / 60.0 if duration_min is not None else None
+
+        # Effective values snapshot
+        ariscat_effective_inputs = {
+            "age_years": age_at_surg,
+            "spo2_percent": preop_spo2,
+            "resp_infection_last_month": None,  # filled below
+            "preop_hgb_g_dl": preop_hgb,
+            "surgical_incision_site": surgical_site_cat,
+            "duration_hours": duration_hours,
+            "emergency_surgery": emergency,
+        }
+
+        # Missing-input detection (Barnabus completeness)
+        for key, val in [
+            ("age_years", age_at_surg),
+            ("spo2_percent", preop_spo2),
+            ("preop_hgb_g_dl", preop_hgb),
+            ("surgical_incision_site", incision_site_raw),
+            ("duration_hours", duration_hours),
+            ("emergency_surgery", emergency),
+        ]:
+            if val is None:
+                ariscat_missing_inputs.append(key)
+
         # Respiratory infection
-        prior_resp = pulmonary_risk_factors.get('prior_respiratory_admissions', {}) or {}
-        resp_diagnoses = pulmonary_risk_factors.get('respiratory_diagnoses', {}) or {}
-        ariscat_flags["respiratory_infection"] = (
-            prior_resp.get('prior_pneumonia', False) or
-            prior_resp.get('prior_respiratory_failure', False) or
-            resp_diagnoses.get('bronchitis', False) or
-            resp_diagnoses.get('pneumonia', False)
+        prior_resp = pulmonary_risk_factors.get("prior_respiratory_admissions", {}) or {}
+        resp_diagnoses = pulmonary_risk_factors.get("respiratory_diagnoses", {}) or {}
+        has_resp_infection = (
+            prior_resp.get("prior_pneumonia", False)
+            or prior_resp.get("prior_respiratory_failure", False)
+            or resp_diagnoses.get("bronchitis", False)
+            or resp_diagnoses.get("pneumonia", False)
         )
+        ariscat_flags["respiratory_infection"] = bool(has_resp_infection)
+        ariscat_effective_inputs["resp_infection_last_month"] = bool(has_resp_infection)
+
         # Anemia (Hgb < 10)
-        hgb = pulmonary_risk_factors.get('preop_hgb')
-        ariscat_flags["anemia"] = hgb is not None and hgb < 10
-        # Surgical incision site (thoracic/abdominal)
-        incision_site = (pulmonary_risk_factors.get('surgery_details') or {}).get('incision_site')
-        ariscat_flags["thoracic_or_abdominal_surgery"] = incision_site in {'thoracic', 'upper_abdominal', 'lower_abdominal'}
+        ariscat_flags["anemia"] = preop_hgb is not None and preop_hgb < 10
+
+        # Surgical incision site (thoracic/abdominal vs peripheral)
+        ariscat_flags["thoracic_or_abdominal_surgery"] = incision_site_raw in {
+            "thoracic",
+            "intrathoracic",
+            "upper_abdominal",
+            "lower_abdominal",
+        }
+
         # Surgery duration > 2h
-        duration_min = (pulmonary_risk_factors.get('surgery_details') or {}).get('surgery_duration_minutes')
-        ariscat_flags["surgery_duration_gt_2h"] = duration_min is not None and duration_min > 120
+        ariscat_flags["surgery_duration_gt_2h"] = duration_hours is not None and duration_hours > 2.0
+
         # Emergency surgery
-        emergency = (pulmonary_risk_factors.get('surgery_details') or {}).get('emergency_status')
         ariscat_flags["emergency_surgery"] = bool(emergency)
-        # Asthma
-        ariscat_flags["asthma"] = resp_diagnoses.get('asthma', False)
+
+        # Asthma (for general pulmonary flags)
+        ariscat_flags["asthma"] = resp_diagnoses.get("asthma", False)
     
     # Calculate COPD risk tier
     copd_risk_tier = None
@@ -710,11 +1134,26 @@ def integrate_cardiac_and_pulmonary_risk(
             )
         # If resp_diagnoses is None, copd_risk_tier remains None (cannot determine)
     
+    # Determine ARISCAT completeness state and PPC percentage.
+    # If the ARISCAT module was able to compute a score, we treat the inputs as
+    # effectively complete for Barnabus purposes, even if some fields in our
+    # derived snapshot could not be back-filled (e.g., duration inferred elsewhere).
+    if ariscat_score is not None:
+        ariscat_state = "complete"
+        ariscat_missing_inputs = []
+    else:
+        ariscat_state = "incomplete"
+
+    ariscat_ppc = None
+    if ariscat_score is not None:
+        ariscat_ppc = round(_calculate_score_percentage("ARISCAT", ariscat_score), 1)
+
     # Pulmonary lab_risk
     pulm_lab_risk = enhanced_pulm.get("lab_risk", {}) or {}
     pulm_lab_values = {
         "wbc": pulm_lab_risk.get("wbc"),
         "bnp": pulm_lab_risk.get("bnp"),
+        "albumin": pulm_lab_risk.get("albumin"),
     }
     
     # Cardiac calculators - build structure for each
@@ -855,9 +1294,53 @@ def integrate_cardiac_and_pulmonary_risk(
     # Get temporal patterns
     cardiac_temporal = cardiac_report.get("cardiac_temporal_patterns", {})
     
+    # Build hepatic VOCAL-Penn inputs using available data (best-effort).
+    pulmonary_albumin = pulm_lab_values.get("albumin")
+    # Use creatinine, sodium, INR, platelets, bilirubin from cardiac lab intelligence if available
+    cardiac_labs = cardiac_report.get("labs", {}) or {}
+    creat_last = None
+    na_last = None
+    inr_last = None
+    platelets_last = None
+    bilirubin_last = None
+    
+    # Creatinine from renal_trend (now includes last value)
+    renal_trend = cardiac_labs.get("renal_trend", {}) or {}
+    creat_last = renal_trend.get("last")
+    
+    # Sodium from electrolytes
+    electrolytes = cardiac_labs.get("electrolytes", {}) or {}
+    na_last = electrolytes.get("na")
+    
+    # Hepatic labs (INR, platelets, bilirubin)
+    hepatic_labs = cardiac_labs.get("hepatic", {}) or {}
+    inr_last = hepatic_labs.get("inr_last")
+    platelets_last = hepatic_labs.get("platelets_last")
+    bilirubin_last = hepatic_labs.get("bilirubin_last")
+
+    hepatic_inputs = VocalPennInputs(
+        asaClass=3,  # cannot derive ASA class from MIMIC subset; default to 3
+        age=pulmonary_risk_factors.get("age_at_surgery") if pulmonary_risk_factors else None,
+        ascitesPresent=False,  # ascites not explicitly modeled in this backend
+        albumin=pulmonary_albumin,
+        inr=inr_last,
+        platelets=platelets_last,
+        surgicalRisk="moderate",
+        bilirubin=bilirubin_last,
+        encephalopathyGrade=0,
+        creatinine=creat_last,
+        sodium=na_last,
+        patientId=str(subject_id),
+        caseId=str(hadm_id),
+        calculatedBy="auto",
+    )
+
+    vocal_penn_result = calculate_vocal_penn(hepatic_inputs)
+
     # Build calculated_risk_factors structure
     # Cardiac: shared lab_risk, overall_risk_category, and temporal_patterns at cardiac level
     # Pulmonary: ARISCAT info at pulmonary level, lab_risk also at pulmonary level
+    # Hepatic: VOCAL-Penn block for Barnabus integration
     calculated_risk_factors = {
         "cardiac": {
             "overall_risk_category": cardiac_overall_cat,
@@ -871,15 +1354,62 @@ def integrate_cardiac_and_pulmonary_risk(
         },
         "pulmonary": {
             "ARISCAT": {
+                "version": "ARISCAT-1.0",
+                "state": ariscat_state,
                 "score": ariscat_score,
-                "score_percentage": round(_calculate_score_percentage("ARISCAT", ariscat_score), 1) if ariscat_score is not None else None,
-                "risk_tier": _normalize_risk_tier(ariscat_cat),
+                "risk_category": ariscat_cat,
+                "ppc_risk_percent": ariscat_ppc,
+                "contributors": ariscat.get("contributors", []),
+                "normalized_tier": ariscat_cat,
+                "completeness": "complete" if ariscat_state == "complete" else "incomplete",
+                "missing_inputs": ariscat_missing_inputs or None,
+                "input_snapshot": {
+                    "effective_values": ariscat_effective_inputs,
+                    "raw_sources": {
+                        "subject_id": subject_id,
+                        "hadm_id": hadm_id,
+                    },
+                    "manual_overrides": {},
+                },
             },
             "COPD_risk_tier": copd_risk_tier,
             "lab_risk": {
                 **pulm_lab_values,
                 "flags": ariscat_flags,
             },
+        },
+        "hepatic": {
+            "VOCAL_Penn": {
+                "vocalPennScore": vocal_penn_result.vocalPennScore,
+                "thirtyDayMortalityPercent": vocal_penn_result.thirtyDayMortalityPercent,
+                "ninetyDayMortalityPercent": vocal_penn_result.ninetyDayMortalityPercent,
+                "riskCategory": vocal_penn_result.riskCategory,
+                "childPugh": {
+                    "score": vocal_penn_result.childPugh.score,
+                    "class": vocal_penn_result.childPugh.class_,
+                    "components": {
+                        name: {
+                            "value": comp.value,
+                            "points": comp.points,
+                            **({"grade": comp.grade} if comp.grade is not None else {}),
+                        }
+                        for name, comp in vocal_penn_result.childPugh.components.items()
+                    },
+                },
+                "meldNa": {
+                    "score": vocal_penn_result.meldNa.score,
+                    "interpretation": vocal_penn_result.meldNa.interpretation,
+                    "components": vocal_penn_result.meldNa.components,
+                },
+                "version": vocal_penn_result.version,
+                "inputs": vocal_penn_result.inputs,
+                "timestamp": vocal_penn_result.timestamp,
+                "calculatedBy": vocal_penn_result.calculatedBy,
+                "pointsBreakdown": vocal_penn_result.pointsBreakdown,
+                "normalizedTier": vocal_penn_result.normalizedTier,
+                "completeness": vocal_penn_result.completeness,
+                "missingInputs": vocal_penn_result.missingInputs or None,
+            }
         },
     }
 
@@ -1111,8 +1641,251 @@ def integrate_cardiac_and_pulmonary_risk(
         surgery_time=surgery_time,
     )
 
+    # ---------------- HPI Red-Flags placeholder (for Barnabus integration) ---------------- 
+    # This backend does not extract HPI from MIMIC-III; we expose a stable block
+    # so that downstream Barnabus services can overlay real HPI data.
+    hpi_red_flags = {
+        "chestPain": {
+            "present": False,
+        },
+        "shortnessOfBreath": {
+            "present": False,
+        },
+        "acknowledgment": None,
+    }
+
+    # ---------------- Comorbidity Blocks Evaluation ---------------- 
+    # Build PatientClinicalData from extracted data
+    patient_clinical_data = _build_patient_clinical_data(
+        pulm_extractor=pulm_extractor,
+        cardiac_extractor=cardiac_extractor,
+        proc_extractor=proc_extractor,
+        subject_id=subject_id,
+        hadm_id=hadm_id,
+        cardiac_report=cardiac_report,
+        enhanced_pulm=enhanced_pulm,
+        recent_vital_signs=recent_vital_signs,
+        hpi_red_flags=hpi_red_flags,
+    )
+    
+    # Evaluate comorbidity blocks (using example CAD/CHF block for now)
+    comorbidity_blocks = _evaluate_comorbidity_blocks(
+        patient_clinical_data=patient_clinical_data,
+        surg_ctx=surg_ctx,
+    )
+    
+    # Merge triggered blocks to remove duplicates and resolve conflicts
+    triggered_blocks = [b for b in comorbidity_blocks if b.get('triggered', False)]
+    merged_content: Optional[MergedContent] = None
+    if len(triggered_blocks) > 1:
+        merged_content = merge_blocks(triggered_blocks)
+    
+    # Generate decision support recommendations
+    clinical_recommendations: Optional[ClinicalRecommendations] = None
+    if triggered_blocks:
+        clinical_recommendations = generate_recommendations(triggered_blocks, patient_clinical_data)
+
+    # ---------------- Clinical Change Detection ---------------- 
+    change_analysis_result = None
+    change_summary_result = None
+    clinical_patterns_result = []
+    
+    if surgery_time:
+        try:
+            # Prepare lab series data for change detection
+            lab_series_dict = {}
+            lab_value_series_list = []
+            
+            # Common labs to analyze
+            lab_names = ['creatinine', 'bnp', 'troponin', 'hemoglobin', 'sodium', 'potassium', 
+                        'glucose', 'albumin', 'platelets', 'inr']
+            
+            for lab_name in lab_names:
+                # Get lab series from cardiac extractor
+                lab_series = cardiac_extractor._get_lab_series_by_time_window(
+                    subject_id=subject_id,
+                    lab_name=lab_name,
+                    anchor_time=surgery_time,
+                    hours_before=168  # 7 days
+                )
+                
+                if lab_series is not None and not lab_series.empty:
+                    # Filter to pre-op only and ensure valid values
+                    lab_series = lab_series[lab_series['CHARTTIME'] < pd.to_datetime(surgery_time)].copy()
+                    lab_series = lab_series[lab_series['VALUENUM'].notna()].copy()
+                    
+                    if not lab_series.empty:
+                        lab_series_dict[lab_name] = lab_series
+                        
+                        # Create LabValueSeries for temporal features
+                        values = lab_series['VALUENUM'].tolist()
+                        timestamps = [ts.isoformat() if isinstance(ts, pd.Timestamp) else str(ts) 
+                                     for ts in lab_series['CHARTTIME'].tolist()]
+                        
+                        # Get unit from first row if available
+                        unit = None
+                        if 'VALUEUOM' in lab_series.columns:
+                            unit = lab_series['VALUEUOM'].iloc[0] if not lab_series['VALUEUOM'].isna().iloc[0] else None
+                        
+                        lab_value_series_list.append(
+                            LabValueSeries(
+                                testName=lab_name,
+                                values=values,
+                                timestamps=timestamps,
+                                unit=unit
+                            )
+                        )
+            
+            # Run change detection if we have lab data
+            if lab_series_dict:
+                change_detector = SurgeryAwareChangeDetector(
+                    surgery_datetime=surgery_time,
+                    lab_trend_data=None,  # Will be populated from lab series
+                    temporal_patterns=None
+                )
+                
+                # Analyze changes
+                unified_analysis = change_detector.analyze_changes(
+                    subject_id=subject_id,
+                    hadm_id=hadm_id,
+                    lab_series=lab_series_dict,
+                    max_hours_before=168  # 7 days
+                )
+                
+                # Convert to ChangeAnalysis format
+                # Create analysis window
+                analysis_window = AnalysisWindow(
+                    start=(pd.to_datetime(surgery_time) - pd.Timedelta(days=7)).isoformat(),
+                    end=surgery_time.isoformat() if isinstance(surgery_time, datetime) else str(surgery_time),
+                    durationDays=7.0
+                )
+                
+                # Convert changes from legacy format to ClinicalChange format
+                clinical_changes = []
+                for change_result in unified_analysis.changes:
+                    # Convert QuantitativeDelta to ClinicalChange
+                    delta = change_result.quantitative_delta
+                    
+                    # Determine change type and category
+                    
+                    # Create quantitative data
+                    quantitative_data = QuantitativeData(
+                        testName=delta.parameter_name,
+                        previousValue=delta.baseline_value,
+                        currentValue=delta.current_value,
+                        unit=None,  # Unit not available in legacy format
+                        delta=delta.delta_value,
+                        percentChange=delta.delta_percent,
+                        rateOfChange=None
+                    )
+                    
+                    # Determine risk change
+                    if delta.delta_value is not None:
+                        if delta.delta_value > 0:
+                            risk_change = RiskChange.INCREASE
+                        elif delta.delta_value < 0:
+                            risk_change = RiskChange.DECREASE
+                        else:
+                            risk_change = RiskChange.NEUTRAL
+                    else:
+                        risk_change = RiskChange.NEUTRAL
+                    
+                    # Map lab to category (using module function)
+                    lab_category = ccd_module._map_lab_to_category(delta.parameter_name)
+                    
+                    # Create clinical change
+                    clinical_change = ClinicalChange(
+                        timestamp=delta.current_timestamp.isoformat() if delta.current_timestamp else datetime.now().isoformat(),
+                        type=ChangeType.LAB,
+                        category=lab_category,
+                        description=f"{delta.parameter_name} changed from {delta.baseline_value} to {delta.current_value}",
+                        quantitativeData=quantitative_data,
+                        criticality=delta.clinical_significance.value,
+                        clinicalImpact=ClinicalImpact(
+                            riskChange=risk_change,
+                            affectsSurgicalPlanning=delta.clinical_significance.value in ['P0', 'P1'],
+                            requiresAction=delta.clinical_significance.value == 'P0'
+                        )
+                    )
+                    clinical_changes.append(clinical_change)
+                
+                # Create integrated trends from lab series
+                integrated_trends = []
+                for lab_series_item in lab_value_series_list:
+                    if len(lab_series_item.values) >= 2:
+                        # Calculate basic trend metrics
+                        previous_value = lab_series_item.values[0]
+                        current_value = lab_series_item.values[-1]
+                        delta = current_value - previous_value
+                        
+                        # Determine trend direction
+                        if delta > 0:
+                            trend_direction = 'increasing'
+                        elif delta < 0:
+                            trend_direction = 'decreasing'
+                        else:
+                            trend_direction = 'stable'
+                        
+                        # Calculate temporal features (using module functions)
+                        acceleration = ccd_module._calculate_acceleration(lab_series_item.values)
+                        volatility = ccd_module._calculate_volatility(lab_series_item.values)
+                        diurnal_pattern = ccd_module._detect_diurnal_pattern_enhanced(
+                            lab_series_item.timestamps,
+                            lab_series_item.values
+                        )
+                        outlier_count = ccd_module._count_outliers(lab_series_item.values)
+                        
+                        temporal_features = TemporalFeatures(
+                            acceleration=acceleration,
+                            volatility=volatility,
+                            seasonality=diurnal_pattern,
+                            outlierCount=outlier_count
+                        )
+                        
+                        integrated_trend = IntegratedTrend(
+                            parameterName=lab_series_item.testName,
+                            test=lab_series_item.testName,
+                            trendDirection=trend_direction,
+                            confidence='high' if len(lab_series_item.values) >= 3 else 'moderate',
+                            dataSources=['lab_series'],
+                            trendDetails={
+                                'delta': delta,
+                                'previousValue': previous_value,
+                                'currentValue': current_value
+                            },
+                            temporalFeatures=temporal_features
+                        )
+                        integrated_trends.append(integrated_trend)
+                
+                # Create ChangeAnalysis (order: required fields first, then optional)
+                change_analysis_result = ChangeAnalysis(
+                    analysisWindow=analysis_window,
+                    metrics=ChangeAnalysisMetrics(
+                        totalChanges=len(clinical_changes),
+                        criticalChanges=len([c for c in clinical_changes if c.criticality == 'P0']),
+                        significantLabTrends=len([t for t in integrated_trends if t.significance]),
+                        stabilityScore=unified_analysis.summary.get('stability_score', 100.0)
+                    ),
+                    changes=clinical_changes,
+                    integratedTrends=integrated_trends
+                )
+                
+                # Generate change summary
+                change_summary_result = generate_change_summary(change_analysis_result)
+                
+                # Detect clinical patterns
+                clinical_patterns_result = detect_clinical_patterns(
+                    clinical_changes,
+                    integrated_trends
+                )
+        except Exception as e:
+            # If change detection fails, log but don't break the main flow
+            import traceback
+            print(f"Warning: Clinical change detection failed: {e}")
+            traceback.print_exc()
+
     # ---------------- Final JSON-like dict ---------------- 
-    return {
+    result = {
         "subject_id": subject_id,
         "hadm_id": hadm_id,
         "surgery_time": surgery_time.isoformat() if isinstance(surgery_time, datetime) else None,
@@ -1122,6 +1895,7 @@ def integrate_cardiac_and_pulmonary_risk(
         "cardiac_lab_flags": lab_flags,
         "recommendations": recommendations,
         "trend_analysis": temporal_narrative,
+        "hpi_red_flags": hpi_red_flags,
         "recent_vital_signs": recent_vital_signs,
         "lab_summary": lab_summary,
         "surgery": {
@@ -1137,7 +1911,184 @@ def integrate_cardiac_and_pulmonary_risk(
             "data_completeness": round(data_completeness, 3),
             "cardiac_consensus_factor": consensus_factor,
         },
+        "comorbidity_blocks": comorbidity_blocks,
     }
+    
+    # Add consolidated comorbidity content summary
+    triggered_with_content = [
+        b for b in comorbidity_blocks 
+        if b.get('triggered', False) and b.get('personalizedContent')
+    ]
+    if triggered_with_content:
+        result["comorbidity_content"] = {
+            "summary": f"{len(triggered_with_content)} comorbidity block(s) triggered",
+            "blocks": [
+                {
+                    "blockId": b.get("blockId"),
+                    "conditionName": b.get("conditionName"),
+                    "riskLevel": b.get("riskLevel"),
+                    "personalizedContent": b.get("personalizedContent", {}),
+                    "contentSections": b.get("contentSections", {}),
+                }
+                for b in triggered_with_content
+            ],
+            "totalBlocks": len(comorbidity_blocks),
+            "triggeredCount": len(triggered_with_content),
+        }
+    
+    # Add merged content if multiple blocks triggered
+    if merged_content:
+        result["merged_recommendations"] = {
+            "monitoring": [item.text for item in merged_content.monitoring],
+            "medication": [item.text for item in merged_content.medication],
+            "consultation": [item.text for item in merged_content.consultation],
+            "procedure": [item.text for item in merged_content.procedure],
+            "patientInstructions": [item.text for item in merged_content.patientInstructions],
+            "conflicts": [
+                {
+                    "conflictingItems": [item.text for item in conflict.conflictingItems],
+                    "resolution": conflict.resolution,
+                    "mergedText": conflict.mergedText,
+                    "rationale": conflict.rationale,
+                }
+                for conflict in merged_content.conflicts
+            ],
+            "requiresClinicianReview": merged_content.requiresClinicianReview,
+            "provenance": merged_content.provenance,
+        }
+    
+    # Add decision support recommendations
+    if clinical_recommendations:
+        result["clinical_recommendations"] = {
+            "requiredActions": clinical_recommendations.requiredActions,
+            "suggestedActions": clinical_recommendations.suggestedActions,
+            "consultations": [
+                {
+                    "specialty": c.specialty,
+                    "urgency": c.urgency,
+                    "reason": c.reason,
+                    "blockSource": c.blockSource,
+                }
+                for c in clinical_recommendations.consultationRecommendations
+            ],
+            "monitoring": [
+                {
+                    "type": m.type,
+                    "duration": m.duration,
+                    "frequency": m.frequency,
+                    "reason": m.reason,
+                    "blockSource": m.blockSource,
+                }
+                for m in clinical_recommendations.monitoringRequirements
+            ],
+            "medicationAdjustments": [
+                {
+                    "medication": m.medication,
+                    "action": m.action,
+                    "details": m.details,
+                    "urgency": m.urgency,
+                    "reason": m.reason,
+                    "blockSource": m.blockSource,
+                }
+                for m in clinical_recommendations.medicationAdjustments
+            ],
+            "flags": clinical_recommendations.flags,
+        }
+    
+    # Add clinical change detection results
+    if change_analysis_result:
+        result["clinical_change_analysis"] = {
+            "analysisWindow": {
+                "start": change_analysis_result.analysisWindow.start,
+                "end": change_analysis_result.analysisWindow.end,
+                "durationDays": change_analysis_result.analysisWindow.durationDays,
+            },
+            "changeCounts": {
+                "total": change_analysis_result.metrics.totalChanges,
+                "critical": change_analysis_result.metrics.criticalChanges,
+                "important": len([c for c in change_analysis_result.changes if c.criticality == 'P1']),
+                "informational": len([c for c in change_analysis_result.changes if c.criticality == 'P2']),
+            },
+            "stability": {
+                "stabilityScore": change_summary_result.stability.stabilityScore if change_summary_result else None,
+                "volatilityIndex": change_summary_result.stability.volatilityIndex if change_summary_result else None,
+                "trendStability": change_summary_result.stability.trendStability if change_summary_result else None,
+                "riskLevel": change_summary_result.stability.riskLevel if change_summary_result else None,
+            },
+            "changes": [
+                {
+                    "timestamp": c.timestamp,
+                    "type": c.type.value if hasattr(c.type, 'value') else str(c.type),
+                    "category": c.category.value if hasattr(c.category, 'value') else str(c.category),
+                    "description": c.description,
+                    "criticality": c.criticality,
+                    "quantitativeData": {
+                        "testName": c.quantitativeData.testName if c.quantitativeData else None,
+                        "previousValue": c.quantitativeData.previousValue if c.quantitativeData else None,
+                        "currentValue": c.quantitativeData.currentValue if c.quantitativeData else None,
+                        "unit": c.quantitativeData.unit if c.quantitativeData else None,
+                        "delta": c.quantitativeData.delta if c.quantitativeData else None,
+                        "percentChange": c.quantitativeData.percentChange if c.quantitativeData else None,
+                        "rateOfChange": c.quantitativeData.rateOfChange if c.quantitativeData else None,
+                    } if c.quantitativeData else None,
+                    "clinicalImpact": {
+                        "riskChange": c.clinicalImpact.riskChange.value if hasattr(c.clinicalImpact.riskChange, 'value') else str(c.clinicalImpact.riskChange),
+                        "affectsSurgicalPlanning": c.clinicalImpact.affectsSurgicalPlanning,
+                        "requiresAction": c.clinicalImpact.requiresAction,
+                    },
+                }
+                for c in change_analysis_result.changes
+            ],
+            "integratedTrends": [
+                {
+                    "parameterName": t.parameterName,
+                    "test": t.test,
+                    "trendDirection": t.trendDirection,
+                    "confidence": t.confidence,
+                    "significance": t.significance,
+                    "dataSources": t.dataSources,
+                    "temporalFeatures": {
+                        "acceleration": t.temporalFeatures.acceleration if t.temporalFeatures else None,
+                        "volatility": t.temporalFeatures.volatility if t.temporalFeatures else None,
+                        "seasonality": t.temporalFeatures.seasonality if t.temporalFeatures else None,
+                        "outlierCount": t.temporalFeatures.outlierCount if t.temporalFeatures else None,
+                    } if t.temporalFeatures else None,
+                    "trendDetails": t.trendDetails,
+                    "clinicalImplications": t.clinicalImplications,
+                    "monitoringRecommendations": t.monitoringRecommendations,
+                }
+                for t in change_analysis_result.integratedTrends
+            ],
+            "summaries": {
+                "clinical": change_summary_result.summaries.get('clinical') if change_summary_result else None,
+                "export": change_summary_result.summaries.get('export') if change_summary_result else None,
+            } if change_summary_result else None,
+        }
+    
+    # Add detected clinical patterns
+    if clinical_patterns_result:
+        result["clinical_patterns"] = [
+            {
+                "type": p.type,
+                "description": p.description,
+                "significance": p.significance,
+                "clinicalImplication": p.clinicalImplication,
+                "confidence": p.confidence,
+                "changes": [
+                    {
+                        "timestamp": c.timestamp,
+                        "type": c.type.value if hasattr(c.type, 'value') else str(c.type),
+                        "description": c.description,
+                        "criticality": c.criticality,
+                    }
+                    for c in p.changes
+                ],
+                "metadata": p.metadata,
+            }
+            for p in clinical_patterns_result
+        ]
+    
+    return result
 
 
 def predict_preop_risk(

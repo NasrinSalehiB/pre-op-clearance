@@ -206,10 +206,20 @@ class ScoreBasedRiskExtractor:
             ["sodium", "na "]
         ) or [50983, 50824]
 
-        # Sodium
-        self.item_ids_cache["na"] = self._find_lab_item_ids(
-            ["sodium", "na "]
-        ) or [50983, 50824]
+        # INR (International Normalized Ratio) - for hepatic risk
+        self.item_ids_cache["inr"] = self._find_lab_item_ids(
+            ["inr", "international normalized", "prothrombin time", "pt inr"]
+        ) or [51237, 51274, 51275]
+
+        # Platelets - for hepatic risk
+        self.item_ids_cache["platelets"] = self._find_lab_item_ids(
+            ["platelet", "plt"]
+        ) or [51265, 51277]
+
+        # Bilirubin - for hepatic risk
+        self.item_ids_cache["bilirubin"] = self._find_lab_item_ids(
+            ["bilirubin", "total bilirubin", "tbil"]
+        ) or [50885, 50884]
 
     def _get_admit_time(self, hadm_id: int) -> Optional[datetime]:
         if self.admissions_df is None:
@@ -1094,7 +1104,8 @@ class ScoreBasedRiskExtractor:
         creat_series = self._get_lab_series_by_time_window(
             subject_id, "creatinine", anchor_time, hours_before
         ) if anchor_time is not None else None
-        renal_trend = {"slope_per_hour": None, "n_points": 0}
+        creat_info = self._get_last_and_delta(creat_series)
+        renal_trend = {"slope_per_hour": None, "n_points": 0, "last": creat_info["last"]}
         if creat_series is not None and not creat_series.empty:
             vals = creat_series["VALUENUM"].dropna().astype(float)
             times = creat_series["CHARTTIME"]
@@ -1110,6 +1121,34 @@ class ScoreBasedRiskExtractor:
         else:
             notes.append("No pre-admission creatinine trend available (<=1 value).")
         labs["renal_trend"] = renal_trend
+
+        # Hepatic labs: INR, Platelets, Bilirubin (for VOCAL-Penn/Child-Pugh/MELD-Na)
+        inr_series = self._get_lab_series_by_time_window(
+            subject_id, "inr", anchor_time, hours_before
+        ) if anchor_time is not None else None
+        inr_info = self._get_last_and_delta(inr_series)
+        if inr_info["last"] is None:
+            notes.append("No pre-admission INR available.")
+        
+        platelets_series = self._get_lab_series_by_time_window(
+            subject_id, "platelets", anchor_time, hours_before
+        ) if anchor_time is not None else None
+        platelets_info = self._get_last_and_delta(platelets_series)
+        if platelets_info["last"] is None:
+            notes.append("No pre-admission platelets available.")
+        
+        bilirubin_series = self._get_lab_series_by_time_window(
+            subject_id, "bilirubin", anchor_time, hours_before
+        ) if anchor_time is not None else None
+        bilirubin_info = self._get_last_and_delta(bilirubin_series)
+        if bilirubin_info["last"] is None:
+            notes.append("No pre-admission bilirubin available.")
+        
+        labs["hepatic"] = {
+            "inr_last": inr_info["last"],
+            "platelets_last": platelets_info["last"],
+            "bilirubin_last": bilirubin_info["last"],
+        }
 
         # Anemia: last Hgb + RDW if available in window
         hgb_series = self._get_lab_series_by_time_window(

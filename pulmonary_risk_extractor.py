@@ -1135,16 +1135,54 @@ class PulmonaryRiskExtractor:
         Calculate ARISCAT score (0–123) and risk category using the extracted
         pulmonary risk dictionary.
 
-        This implementation follows the standard ARISCAT weighting for:
-        - Age
-        - Pre-op SpO₂
-        - Recent respiratory infection (proxied by pneumonia diagnosis)
-        - Pre-op anemia (Hgb < 10 g/dL)
+        This implementation follows the validated ARISCAT weighting:
 
-        And uses the simplified weights you specified for:
-        - Surgical incision site (thoracic/abdominal = +2 points)
-        - Surgery duration > 2h (= +1 point)
-        - Emergency surgery (= +1 point)
+        Inputs (7 total):
+            1) Age (years)
+            2) Pre-op SpO2 on room air (%)
+            3) Respiratory infection in last month (boolean)
+            4) Pre-op anemia (lowest Hgb in last 30 days, g/dL)
+            5) Surgical incision site: peripheral / upper_abdominal / intrathoracic
+            6) Duration of surgery (hours)
+            7) Emergency surgery (boolean)
+
+        Point allocation (Canet et al. 2010):
+            Age:
+                - ≤50 years → 0 points
+                - 51–80 years → 3 points
+                - >80 years → 16 points
+
+            SpO2 (room air):
+                - ≥96% → 0 points
+                - 91–95% → 8 points
+                - ≤90% → 24 points
+
+            Respiratory infection (last month):
+                - No → 0 points
+                - Yes → 17 points
+
+            Pre-op anemia (lowest Hgb in last 30 days):
+                - ≥10 g/dL → 0 points
+                - <10 g/dL → 11 points
+
+            Surgical incision site:
+                - Peripheral → 0 points
+                - Upper abdominal → 15 points
+                - Intrathoracic → 24 points
+
+            Duration of surgery:
+                - ≤2 hours → 0 points
+                - 2–3 hours → 16 points
+                - >3 hours → 23 points
+
+            Emergency surgery:
+                - No → 0 points
+                - Yes → 8 points
+
+        Risk stratification:
+            - Low risk: ≤26 points
+            - Intermediate risk: 27–44 points
+            - High risk: ≥45 points
 
         Args:
             risk_factors: Output of extract_pulmonary_risk_factors(...)
@@ -1152,7 +1190,7 @@ class PulmonaryRiskExtractor:
         Returns:
             dict with:
                 - score: numeric ARISCAT score
-                - risk_category: 'low' | 'moderate' | 'high'
+                - risk_category: 'low' | 'intermediate' | 'high'
                 - contributors: list of strings describing contributing factors
         """
         score = 0
@@ -1162,114 +1200,141 @@ class PulmonaryRiskExtractor:
         age = risk_factors.get('age_at_surgery')
         if age is not None:
             if age <= 50:
-                pass
-            elif age <= 59:
-                score += 3
-                contributors.append(f"Age {age} years: 3 points")
-            elif age <= 69:
-                score += 16
-                contributors.append(f"Age {age} years: 16 points")
-            elif age <= 79:
-                score += 3
-                contributors.append(f"Age {age} years: 3 points")
-            else:  # age >= 80
-                score += 13
-                contributors.append(f"Age {age} years: 13 points")
+                age_points = 0
+            elif 51 <= age <= 80:
+                age_points = 3
+            else:  # > 80
+                age_points = 16
+            score += age_points
+            contributors.append(f"Age {age} years: {age_points} points")
 
-        # --- SpO2 ---
+        # --- SpO2 (room air) ---
         spo2 = risk_factors.get('preop_spo2')
         if spo2 is not None:
             if spo2 >= 96:
-                pass
+                spo2_points = 0
             elif 91 <= spo2 <= 95:
-                score += 8
-                contributors.append(f"SpO2 {spo2}%: 8 points")
+                spo2_points = 8
             else:  # ≤ 90
-                score += 24
-                contributors.append(f"SpO2 {spo2}%: 24 points")
+                spo2_points = 24
+            score += spo2_points
+            contributors.append(f"SpO2 {spo2}%: {spo2_points} points")
 
-        # --- Respiratory infection (from diagnosis codes) ---
-        # Check for respiratory infection in current admission diagnoses
+        # --- Respiratory infection in last month ---
+        # Use prior respiratory admissions and current diagnoses as proxy.
         resp_diagnoses = risk_factors.get('respiratory_diagnoses', {}) or {}
         prior_resp = risk_factors.get('prior_respiratory_admissions', {}) or {}
-        
-        # Check for respiratory infection (pneumonia, bronchitis, respiratory failure)
+
         has_resp_infection = (
-            prior_resp.get('prior_pneumonia', False) or
-            prior_resp.get('prior_respiratory_failure', False)
+            prior_resp.get('prior_pneumonia', False)
+            or prior_resp.get('prior_respiratory_failure', False)
         )
-        
+
         # Also check current admission diagnoses for bronchitis/pneumonia/respiratory failure
         if not has_resp_infection and self.diagnoses_icd_df is not None:
             subject_id = risk_factors.get('subject_id')
             hadm_id = risk_factors.get('hadm_id')
             if subject_id and hadm_id:
                 current_diag = self.diagnoses_icd_df[
-                    (self.diagnoses_icd_df['SUBJECT_ID'] == subject_id) &
-                    (self.diagnoses_icd_df['HADM_ID'] == hadm_id)
+                    (self.diagnoses_icd_df['SUBJECT_ID'] == subject_id)
+                    & (self.diagnoses_icd_df['HADM_ID'] == hadm_id)
                 ]
                 if not current_diag.empty and self.d_icd_diagnoses_df is not None:
                     code_col = 'ICD9_CODE' if self.icd_version == 'ICD9' else self.icd_code_column
-                    merge_col = 'ICD9_CODE' if self.icd_version == 'ICD9' else ('ICD10_CODE' if 'ICD10_CODE' in self.d_icd_diagnoses_df.columns else 'ICD_CODE')
+                    merge_col = (
+                        'ICD9_CODE'
+                        if self.icd_version == 'ICD9'
+                        else ('ICD10_CODE' if 'ICD10_CODE' in self.d_icd_diagnoses_df.columns else 'ICD_CODE')
+                    )
                     if code_col in current_diag.columns:
                         merged = current_diag.merge(
                             self.d_icd_diagnoses_df,
                             left_on=code_col,
                             right_on=merge_col,
-                            how='left'
+                            how='left',
                         )
                         if 'LONG_TITLE' in merged.columns:
                             titles_lower = merged['LONG_TITLE'].astype(str).str.lower()
-                            has_resp_infection = titles_lower.str.contains('bronchitis|pneumonia|respiratory failure', case=False, na=False).any()
-                        # Also check ICD codes directly
+                            has_resp_infection = titles_lower.str.contains(
+                                'bronchitis|pneumonia|respiratory failure',
+                                case=False,
+                                na=False,
+                            ).any()
                         if not has_resp_infection and code_col in merged.columns:
                             codes_str = merged[code_col].astype(str)
                             if self.icd_version == 'ICD9':
-                                resp_codes = ['466', '480', '481', '482', '483', '484', '485', '486', '51881', '51882', '51884']
+                                resp_codes = [
+                                    '466',
+                                    '480',
+                                    '481',
+                                    '482',
+                                    '483',
+                                    '484',
+                                    '485',
+                                    '486',
+                                    '51881',
+                                    '51882',
+                                    '51884',
+                                ]
                                 has_resp_infection = codes_str.str.startswith(tuple(resp_codes)).any()
                             else:
                                 resp_codes = ['J12', 'J13', 'J14', 'J15', 'J16', 'J17', 'J18', 'J96']
                                 has_resp_infection = codes_str.str.startswith(tuple(resp_codes)).any()
-        
+
         if has_resp_infection:
-            score += 7
-            contributors.append("Respiratory infection: 7 points")
-        
-        # --- Asthma (separate component) ---
-        if resp_diagnoses.get('asthma', False):
-            score += 1
-            contributors.append("Asthma: 1 point")
+            score += 17
+            contributors.append("Respiratory infection in last month: 17 points")
 
-        # --- Anemia (Hgb < 10 g/dL) ---
+        # --- Pre-op anemia (Hgb < 10 g/dL, lowest in last 30 days) ---
         hgb = risk_factors.get('preop_hgb')
-        if hgb is not None and hgb < 10:
-            score += 11
-            contributors.append(f"Anemia (Hgb {hgb} g/dL): 11 points")
+        if hgb is not None:
+            if hgb < 10.0:
+                anemia_points = 11
+            else:
+                anemia_points = 0
+            score += anemia_points
+            contributors.append(f"Pre-op hemoglobin {hgb} g/dL: {anemia_points} points")
 
-        # --- Surgical incision site (thoracic/abdominal = +2) ---
+        # --- Surgical incision site ---
         incision_site = (risk_factors.get('surgery_details') or {}).get('incision_site')
-        if incision_site in {'thoracic', 'upper_abdominal', 'lower_abdominal'}:
-            score += 2
-            contributors.append(f"Surgical incision site ({incision_site}): 2 points")
+        site_points = 0
+        site_label = incision_site or "unknown"
+        if incision_site is not None:
+            if incision_site == 'upper_abdominal':
+                site_points = 15
+            elif incision_site in {'thoracic', 'intrathoracic'}:
+                site_points = 24
+            else:
+                # Treat all other sites as peripheral for ARISCAT purposes
+                site_points = 0
+        score += site_points
+        contributors.append(f"Surgical incision site ({site_label}): {site_points} points")
 
-        # --- Surgery duration > 2h (= +1) ---
+        # --- Duration of surgery (hours) ---
         duration_min = (risk_factors.get('surgery_details') or {}).get('surgery_duration_minutes')
-        if duration_min is not None and duration_min > 120:
-            score += 1
-            contributors.append(f"Surgery duration > 2h: 1 point")
+        duration_points = 0
+        if duration_min is not None:
+            duration_hours = duration_min / 60.0
+            if duration_hours <= 2.0:
+                duration_points = 0
+            elif 2.0 < duration_hours <= 3.0:
+                duration_points = 16
+            else:  # > 3 hours
+                duration_points = 23
+            score += duration_points
+            contributors.append(f"Surgery duration {duration_hours:.1f} hours: {duration_points} points")
 
-        # --- Emergency surgery (= +1) ---
+        # --- Emergency surgery ---
         emergency = (risk_factors.get('surgery_details') or {}).get('emergency_status')
-        if emergency:
-            score += 1
-            contributors.append("Emergency surgery: 1 point")
+        emergency_points = 8 if emergency else 0
+        score += emergency_points
+        contributors.append(f"Emergency surgery: {emergency_points} points")
 
-        # --- Risk category ---
-        # Use standard ARISCAT thresholds
-        if score <= 25:
+        # --- Risk category using validated thresholds ---
+        if score <= 26:
             category = "low"
-        elif score <= 44:
-            category = "moderate"
+        elif 27 <= score <= 44:
+            category = "intermediate"
         else:
             category = "high"
 
