@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  preop-api:
+    build: .
+    container_name: preop_risk_service
+    ports:
+      - "8000:8000"
+    volumes:
+      # Map your local 'data' folder to the container
+      - ./data:/code/data
+    environment:
+      - MIMIC_DATA_DIR=/code/data
+    restart: unless-stopped

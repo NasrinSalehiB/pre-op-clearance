@@ -1,19 +1,3 @@
-"""
-Cardiac & Pulmonary Risk Integration
-
-This module runs three main risk modules:
-  1) Cardiac score-based risk (RCRI, AUB-HAS-2-like, NSQIP-like, Gupta-like)
-  2) Cardiac risk from events/labs/conditions (procedure & event context + temporal trends)
-  3) Pulmonary risk (ARISCAT + labs + temporal pulmonary patterns)
-
-It logs assumptions/heuristics and returns a final JSON-like dict with:
-  - risk_summary (scores + consensus)
-  - event_based_context (narrative)
-  - lab_flags (abnormalities and trend-based flags)
-  - data_quality (missing/inferred fields + assumptions)
-  - recommendations (prioritized)
-"""
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -21,13 +5,16 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from pulmonary_risk_extractor import PulmonaryRiskExtractor
-from score_based_risk import ScoreBasedRiskExtractor
-from procedure_event_risk import ProcedureEventRiskExtractor
-from trend_risk_flags import generate_trend_risk_flags
-from temporal_narrative import generate_temporal_narrative
-from hepatic_risk_calculators import VocalPennInputs, calculate_vocal_penn
-from comorbidity_blocks import (
+# --- UPDATED IMPORTS START ---
+from app.services.extractors.pulmonary import PulmonaryRiskExtractor
+from app.services.extractors.cardiac_score import ScoreBasedRiskExtractor
+from app.services.extractors.procedures import ProcedureEventRiskExtractor
+from app.services.calculators.trends import generate_trend_risk_flags
+from app.services.calculators.narrative import generate_temporal_narrative
+from app.services.calculators.hepatic import VocalPennInputs, calculate_vocal_penn
+
+# Was comorbidity_blocks.py -> now app/core/definitions.py
+from app.core.definitions import (
     PatientClinicalData,
     ProblemListItem,
     MedicationItem,
@@ -53,7 +40,8 @@ from comorbidity_blocks import (
     get_all_comorbidity_blocks,
     calculate_egfr_ckd_epi,
 )
-from clinical_change_detector import (
+
+from app.services.calculators.change_detector import (
     SurgeryAwareChangeDetector,
     LabTrendInput,
     LabValuePoint,
@@ -75,8 +63,11 @@ from clinical_change_detector import (
     TemporalFeatures,
     IntegratedTrend,
 )
-# Import private functions using importlib or access via module
-import clinical_change_detector as ccd_module
+
+# Import private functions via module alias
+import app.services.calculators.change_detector as ccd_module
+
+# --- UPDATED IMPORTS END ---
 
 
 def _build_cardiac_consensus(scores: Dict[str, Any]) -> str:
@@ -94,7 +85,7 @@ def _build_cardiac_consensus(scores: Dict[str, Any]) -> str:
 def _normalize_risk_tier(category: Optional[str]) -> str:
     """
     Normalize risk categories to tier-based system: [critical, high, moderate, low]
-    
+
     Mapping:
     - critical: None (no data) or extreme high-risk scenarios
     - high: "high" from calculators
@@ -103,7 +94,7 @@ def _normalize_risk_tier(category: Optional[str]) -> str:
     """
     if category is None:
         return "critical"  # No data = critical uncertainty
-    
+
     cat_lower = category.lower()
     if cat_lower in ["high"]:
         return "high"
@@ -119,66 +110,70 @@ def _calculate_copd_risk_tier(
     copd_diagnosis: Optional[bool],
     spo2: Optional[float],
     prior_respiratory_admissions: Optional[Dict[str, Any]],
-    smoking_status: Optional[str]
+    smoking_status: Optional[str],
 ) -> Optional[str]:
     """
     Calculate COPD risk tier based on available clinical data.
-    
+
     Clinical logic:
     - Critical: COPD + SpO2 < 90% OR COPD + prior respiratory failure
     - High: COPD + SpO2 90-92% OR COPD + current/former smoker OR COPD + prior pneumonia
     - Moderate: COPD diagnosis present with normal SpO2 (>92%) and no high-risk factors
     - Low: No COPD diagnosis
     - None: Missing diagnosis data (cannot determine COPD status)
-    
+
     Args:
         copd_diagnosis: Boolean indicating if COPD diagnosis is present, or None if data unavailable
         spo2: Pre-operative SpO2 value (percentage)
         prior_respiratory_admissions: Dictionary with prior respiratory admission flags
         smoking_status: Smoking status ('current', 'former', 'never', or None)
-    
+
     Returns:
         Risk tier: "critical", "high", "moderate", "low", or None if data insufficient
     """
     # If COPD diagnosis status cannot be determined (None), return None
     if copd_diagnosis is None:
         return None
-    
+
     # If COPD diagnosis is present
     if copd_diagnosis:
         # Critical: Severe hypoxemia (< 90%) or prior respiratory failure
         if spo2 is not None and spo2 < 90:
             return "critical"
-        
+
         # Check for prior respiratory complications (proxies for COPD severity)
         if prior_respiratory_admissions:
-            prior_resp_failure = prior_respiratory_admissions.get('prior_respiratory_failure', False)
+            prior_resp_failure = prior_respiratory_admissions.get(
+                "prior_respiratory_failure", False
+            )
             if prior_resp_failure:
                 return "critical"
-        
+
         # High: Moderate hypoxemia (90-92%) or smoking history or prior pneumonia
         if spo2 is not None and 90 <= spo2 <= 92:
             return "high"
-        
-        if smoking_status in ['current', 'former']:
+
+        if smoking_status in ["current", "former"]:
             return "high"
-        
+
         if prior_respiratory_admissions:
-            prior_pneumonia = prior_respiratory_admissions.get('prior_pneumonia', False)
+            prior_pneumonia = prior_respiratory_admissions.get("prior_pneumonia", False)
             if prior_pneumonia:
                 return "high"
-        
+
         # Moderate: COPD present but SpO2 normal (>92%) and no other high-risk factors
         return "moderate"
-    
+
     # No COPD diagnosis = low risk
     return "low"
 
 
-def _calculate_score_percentage(calculator_name: str, score: Optional[float]) -> Optional[float]:
+def _calculate_score_percentage(
+    calculator_name: str, score: Optional[float]
+) -> Optional[float]:
     """
     Convert risk scores to clinically validated percentage values.
-    
+
     Based on published literature:
     - RCRI: Score 0 → ~0.4%, 1 → ~0.9%, 2 → ~6.6%, ≥3 → ~11.0% (MACE risk)
     - AUB-HAS-2: Score 0 → ~2%, 1 → ~5%, 2 → ~10%, 3 → ~15%, 4 → ~25% (MACE risk)
@@ -188,9 +183,9 @@ def _calculate_score_percentage(calculator_name: str, score: Optional[float]) ->
     """
     if score is None:
         return None
-    
+
     calculator_lower = calculator_name.lower()
-    
+
     if calculator_lower == "rcri":
         # RCRI MACE risk percentages (from Lee et al. 1999)
         if score == 0:
@@ -201,7 +196,7 @@ def _calculate_score_percentage(calculator_name: str, score: Optional[float]) ->
             return 6.6
         else:  # score >= 3
             return 11.0
-    
+
     elif calculator_lower == "aub-has-2" or calculator_lower == "aub_has2":
         # AUB-HAS-2 MACE risk percentages (estimated from literature)
         if score == 0:
@@ -214,7 +209,7 @@ def _calculate_score_percentage(calculator_name: str, score: Optional[float]) ->
             return 15.0
         else:  # score >= 4
             return 25.0
-    
+
     elif calculator_lower == "nsqip_mace" or calculator_lower == "nsqip mace":
         # NSQIP MACE risk percentages (estimated)
         if score <= 2:
@@ -223,7 +218,7 @@ def _calculate_score_percentage(calculator_name: str, score: Optional[float]) ->
             return 8.0 + ((score - 2) * 2.0)  # 8-12%
         else:  # score >= 5
             return 15.0 + ((score - 4) * 2.5)  # 15-20%
-    
+
     elif calculator_lower == "gupta_mica" or calculator_lower == "gupta mica":
         # Gupta MICA risk percentages (estimated)
         if score <= 1:
@@ -232,7 +227,7 @@ def _calculate_score_percentage(calculator_name: str, score: Optional[float]) ->
             return 5.0 + ((score - 1) * 1.5)  # 5-8%
         else:  # score >= 4
             return 12.0 + ((score - 3) * 3.0)  # 12-18%
-    
+
     elif calculator_lower == "ariscat":
         # ARISCAT pulmonary complication risk percentages (from Canet et al. 2010)
         # Low risk (<26 points): 1.6% PPC rate
@@ -244,7 +239,7 @@ def _calculate_score_percentage(calculator_name: str, score: Optional[float]) ->
             return 13.3  # Intermediate risk category
         else:  # score >= 45
             return 42.1  # High risk category
-    
+
     return None  # Unknown calculator
 
 
@@ -256,20 +251,20 @@ def _extract_recent_vital_signs(
 ) -> Dict[str, Any]:
     """
     Extract recent vital signs from chartevents before surgery_time.
-    
+
     Collects the most recent pre-operative vital sign values:
     - Heart Rate (HR)
     - Blood Pressure (Systolic/Diastolic)
     - Temperature
     - Respiratory Rate
     - SpO2 (already extracted, but included for completeness)
-    
+
     Args:
         pulm_extractor: PulmonaryRiskExtractor instance with loaded data
         subject_id: Patient subject ID
         hadm_id: Hospital admission ID
         surgery_time: Surgery time (all vitals must be before this time)
-    
+
     Returns:
         Dictionary with recent vital sign values (None if not available)
     """
@@ -282,19 +277,19 @@ def _extract_recent_vital_signs(
         "respiratory_rate": None,
         "spo2": None,
     }
-    
+
     if pulm_extractor.chartevents_df is None or pulm_extractor.d_items_df is None:
         return vital_signs
-    
+
     if surgery_time is None:
         return vital_signs
-    
+
     # Convert surgery_time to pandas Timestamp if needed
     if isinstance(surgery_time, datetime):
         surgery_time_ts = pd.Timestamp(surgery_time)
     else:
         surgery_time_ts = pd.to_datetime(surgery_time)
-    
+
     # Common MIMIC-III item IDs for vital signs (with fallbacks)
     # These are common IDs, but we should try to detect them dynamically
     vital_item_ids = {
@@ -304,80 +299,96 @@ def _extract_recent_vital_signs(
         "mean_arterial_pressure": [456, 52, 6702, 220181],  # MAP
         "temperature": [223761, 223762, 676, 677, 678, 679],  # Temperature (F/C)
         "respiratory_rate": [220210, 618, 615, 224690, 224689],  # Respiratory Rate
-        "spo2": pulm_extractor.item_ids_cache.get('spo2', [646, 220277]),  # SpO2
+        "spo2": pulm_extractor.item_ids_cache.get("spo2", [646, 220277]),  # SpO2
     }
-    
+
     # Try to detect item IDs dynamically if possible
     if pulm_extractor.d_items_df is not None:
-        d_items_lower = pulm_extractor.d_items_df['LABEL'].astype(str).str.lower()
-        
+        d_items_lower = pulm_extractor.d_items_df["LABEL"].astype(str).str.lower()
+
         # Heart Rate
-        hr_matches = pulm_extractor.d_items_df[d_items_lower.str.contains('heart rate|hr|pulse rate', na=False, regex=True)]
+        hr_matches = pulm_extractor.d_items_df[
+            d_items_lower.str.contains("heart rate|hr|pulse rate", na=False, regex=True)
+        ]
         if not hr_matches.empty:
-            vital_item_ids["heart_rate"] = hr_matches['ITEMID'].tolist()[:5]
-        
+            vital_item_ids["heart_rate"] = hr_matches["ITEMID"].tolist()[:5]
+
         # Blood Pressure
-        sbp_matches = pulm_extractor.d_items_df[d_items_lower.str.contains('systolic|sbp', na=False, regex=True)]
+        sbp_matches = pulm_extractor.d_items_df[
+            d_items_lower.str.contains("systolic|sbp", na=False, regex=True)
+        ]
         if not sbp_matches.empty:
-            vital_item_ids["systolic_bp"] = sbp_matches['ITEMID'].tolist()[:5]
-        
-        dbp_matches = pulm_extractor.d_items_df[d_items_lower.str.contains('diastolic|dbp', na=False, regex=True)]
+            vital_item_ids["systolic_bp"] = sbp_matches["ITEMID"].tolist()[:5]
+
+        dbp_matches = pulm_extractor.d_items_df[
+            d_items_lower.str.contains("diastolic|dbp", na=False, regex=True)
+        ]
         if not dbp_matches.empty:
-            vital_item_ids["diastolic_bp"] = dbp_matches['ITEMID'].tolist()[:5]
-        
-        map_matches = pulm_extractor.d_items_df[d_items_lower.str.contains('mean arterial|map', na=False, regex=True)]
+            vital_item_ids["diastolic_bp"] = dbp_matches["ITEMID"].tolist()[:5]
+
+        map_matches = pulm_extractor.d_items_df[
+            d_items_lower.str.contains("mean arterial|map", na=False, regex=True)
+        ]
         if not map_matches.empty:
-            vital_item_ids["mean_arterial_pressure"] = map_matches['ITEMID'].tolist()[:5]
-        
+            vital_item_ids["mean_arterial_pressure"] = map_matches["ITEMID"].tolist()[
+                :5
+            ]
+
         # Temperature
-        temp_matches = pulm_extractor.d_items_df[d_items_lower.str.contains('temperature|temp', na=False, regex=True)]
+        temp_matches = pulm_extractor.d_items_df[
+            d_items_lower.str.contains("temperature|temp", na=False, regex=True)
+        ]
         if not temp_matches.empty:
-            vital_item_ids["temperature"] = temp_matches['ITEMID'].tolist()[:5]
-        
+            vital_item_ids["temperature"] = temp_matches["ITEMID"].tolist()[:5]
+
         # Respiratory Rate
-        rr_matches = pulm_extractor.d_items_df[d_items_lower.str.contains('respiratory rate|rr|fio2', na=False, regex=True)]
+        rr_matches = pulm_extractor.d_items_df[
+            d_items_lower.str.contains("respiratory rate|rr|fio2", na=False, regex=True)
+        ]
         if not rr_matches.empty:
-            vital_item_ids["respiratory_rate"] = rr_matches['ITEMID'].tolist()[:5]
-    
+            vital_item_ids["respiratory_rate"] = rr_matches["ITEMID"].tolist()[:5]
+
     # Extract all vital signs from chartevents
     # Use SUBJECT_ID + time window approach (like labs) to allow cross-admission data
     # but prioritize current admission
-    all_vital_itemids = [itemid for itemids in vital_item_ids.values() for itemid in itemids]
-    
+    all_vital_itemids = [
+        itemid for itemids in vital_item_ids.values() for itemid in itemids
+    ]
+
     chart_events = pulm_extractor.chartevents_df[
-        (pulm_extractor.chartevents_df['SUBJECT_ID'] == subject_id) &
-        (pulm_extractor.chartevents_df['ITEMID'].isin(all_vital_itemids))
+        (pulm_extractor.chartevents_df["SUBJECT_ID"] == subject_id)
+        & (pulm_extractor.chartevents_df["ITEMID"].isin(all_vital_itemids))
     ].copy()
-    
+
     if chart_events.empty:
         return vital_signs
-    
+
     # Convert CHARTTIME to datetime and filter for pre-operative values
-    chart_events['CHARTTIME'] = pd.to_datetime(chart_events['CHARTTIME'])
-    preop_events = chart_events[chart_events['CHARTTIME'] < surgery_time_ts]
-    
+    chart_events["CHARTTIME"] = pd.to_datetime(chart_events["CHARTTIME"])
+    preop_events = chart_events[chart_events["CHARTTIME"] < surgery_time_ts]
+
     if preop_events.empty:
         return vital_signs
-    
+
     # Sort by time (most recent first)
-    preop_events = preop_events.sort_values('CHARTTIME', ascending=False)
-    
+    preop_events = preop_events.sort_values("CHARTTIME", ascending=False)
+
     # Extract most recent value for each vital sign
     for vital_name, itemids in vital_item_ids.items():
-        vital_events = preop_events[preop_events['ITEMID'].isin(itemids)]
+        vital_events = preop_events[preop_events["ITEMID"].isin(itemids)]
         if not vital_events.empty:
             # Get most recent value
-            value = vital_events['VALUENUM'].iloc[0]
+            value = vital_events["VALUENUM"].iloc[0]
             if pd.notna(value):
                 vital_signs[vital_name] = float(value)
-    
+
     return vital_signs
 
 
 def _format_relative_time(capture_time: datetime, surgery_time: datetime) -> str:
     """
     Format relative time between capture_time and surgery_time.
-    
+
     Examples:
         - "1 hour ago"
         - "2 days ago"
@@ -385,7 +396,7 @@ def _format_relative_time(capture_time: datetime, surgery_time: datetime) -> str
         - "2 weeks ago"
     """
     delta = surgery_time - capture_time
-    
+
     if delta.total_seconds() < 3600:  # Less than 1 hour
         minutes = int(delta.total_seconds() / 60)
         return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
@@ -403,81 +414,86 @@ def _format_relative_time(capture_time: datetime, surgery_time: datetime) -> str
         return f"{months} month{'s' if months != 1 else ''} ago"
 
 
-def _get_lab_normal_ranges(lab_name: str, gender: Optional[str] = None) -> Dict[str, Optional[float]]:
+def _get_lab_normal_ranges(
+    lab_name: str, gender: Optional[str] = None
+) -> Dict[str, Optional[float]]:
     """
     Get normal range for a lab value based on lab name and patient gender.
-    
+
     Args:
         lab_name: Name of the lab (e.g., 'hgb', 'creatinine', 'bnp')
         gender: Patient gender ('M' or 'F')
-    
+
     Returns:
         Dictionary with 'min' and 'max' normal values, or None if not applicable
     """
     # Normal ranges (clinically standard values)
     ranges: Dict[str, Dict[str, Dict[str, float]]] = {
-        'hgb': {
-            'M': {'min': 13.0, 'max': 17.0},  # g/dL
-            'F': {'min': 12.0, 'max': 15.0},  # g/dL
+        "hgb": {
+            "M": {"min": 13.0, "max": 17.0},  # g/dL
+            "F": {"min": 12.0, "max": 15.0},  # g/dL
         },
-        'creatinine': {
-            'M': {'min': 0.7, 'max': 1.3},  # mg/dL
-            'F': {'min': 0.6, 'max': 1.1},  # mg/dL
+        "creatinine": {
+            "M": {"min": 0.7, "max": 1.3},  # mg/dL
+            "F": {"min": 0.6, "max": 1.1},  # mg/dL
         },
-        'bnp': {
-            'M': {'min': 0, 'max': 100},  # pg/mL (age-dependent, but 100 is common cutoff)
-            'F': {'min': 0, 'max': 100},  # pg/mL
+        "bnp": {
+            "M": {
+                "min": 0,
+                "max": 100,
+            },  # pg/mL (age-dependent, but 100 is common cutoff)
+            "F": {"min": 0, "max": 100},  # pg/mL
         },
-        'troponin': {
-            'M': {'min': 0, 'max': 0.04},  # ng/mL (ULN varies by assay, 0.04 is common)
-            'F': {'min': 0, 'max': 0.04},  # ng/mL
+        "troponin": {
+            "M": {"min": 0, "max": 0.04},  # ng/mL (ULN varies by assay, 0.04 is common)
+            "F": {"min": 0, "max": 0.04},  # ng/mL
         },
-        'wbc': {
-            'M': {'min': 4.0, 'max': 11.0},  # K/uL
-            'F': {'min': 4.0, 'max': 11.0},  # K/uL
+        "wbc": {
+            "M": {"min": 4.0, "max": 11.0},  # K/uL
+            "F": {"min": 4.0, "max": 11.0},  # K/uL
         },
-        'crp': {
-            'M': {'min': 0, 'max': 3.0},  # mg/L (normal < 3, elevated > 10)
-            'F': {'min': 0, 'max': 3.0},  # mg/L
+        "crp": {
+            "M": {"min": 0, "max": 3.0},  # mg/L (normal < 3, elevated > 10)
+            "F": {"min": 0, "max": 3.0},  # mg/L
         },
-        'albumin': {
-            'M': {'min': 3.5, 'max': 5.0},  # g/dL
-            'F': {'min': 3.5, 'max': 5.0},  # g/dL
+        "albumin": {
+            "M": {"min": 3.5, "max": 5.0},  # g/dL
+            "F": {"min": 3.5, "max": 5.0},  # g/dL
         },
-        'lactate': {
-            'M': {'min': 0.5, 'max': 2.2},  # mmol/L
-            'F': {'min': 0.5, 'max': 2.2},  # mmol/L
+        "lactate": {
+            "M": {"min": 0.5, "max": 2.2},  # mmol/L
+            "F": {"min": 0.5, "max": 2.2},  # mmol/L
         },
-        'k': {
-            'M': {'min': 3.5, 'max': 5.0},  # mEq/L
-            'F': {'min': 3.5, 'max': 5.0},  # mEq/L
+        "k": {
+            "M": {"min": 3.5, "max": 5.0},  # mEq/L
+            "F": {"min": 3.5, "max": 5.0},  # mEq/L
         },
-        'na': {
-            'M': {'min': 136, 'max': 145},  # mEq/L
-            'F': {'min': 136, 'max': 145},  # mEq/L
+        "na": {
+            "M": {"min": 136, "max": 145},  # mEq/L
+            "F": {"min": 136, "max": 145},  # mEq/L
         },
-        'mg': {
-            'M': {'min': 1.7, 'max': 2.2},  # mg/dL
-            'F': {'min': 1.7, 'max': 2.2},  # mg/dL
+        "mg": {
+            "M": {"min": 1.7, "max": 2.2},  # mg/dL
+            "F": {"min": 1.7, "max": 2.2},  # mg/dL
         },
-        'rdw': {
-            'M': {'min': 11.5, 'max': 14.5},  # %
-            'F': {'min': 11.5, 'max': 14.5},  # %
+        "rdw": {
+            "M": {"min": 11.5, "max": 14.5},  # %
+            "F": {"min": 11.5, "max": 14.5},  # %
         },
     }
-    
+
     if lab_name.lower() not in ranges:
-        return {'min': None, 'max': None}
-    
+        return {"min": None, "max": None}
+
     lab_ranges = ranges[lab_name.lower()]
-    
+
     # Use gender-specific range if available, otherwise use 'M' as default
     if gender and gender.upper() in lab_ranges:
         return lab_ranges[gender.upper()]
-    elif 'M' in lab_ranges:
-        return lab_ranges['M']
+    elif "M" in lab_ranges:
+        return lab_ranges["M"]
     else:
-        return {'min': None, 'max': None}
+        return {"min": None, "max": None}
 
 
 def _extract_lab_summary(
@@ -489,120 +505,158 @@ def _extract_lab_summary(
 ) -> Dict[str, Any]:
     """
     Extract lab summary with actual values, normal ranges (sex-based), and capture times.
-    
+
     Args:
         pulm_extractor: PulmonaryRiskExtractor instance with loaded data
         cardiac_extractor: ScoreBasedRiskExtractor instance with loaded data
         subject_id: Patient subject ID
         hadm_id: Hospital admission ID
         surgery_time: Surgery time (all labs must be before this time)
-    
+
     Returns:
         Dictionary with lab summaries including value, normal_range, and captured_ago
     """
     lab_summary: Dict[str, Any] = {}
-    
+
     if surgery_time is None:
         return lab_summary
-    
+
     # Convert surgery_time to datetime if needed
     if isinstance(surgery_time, datetime):
         surgery_time_dt = surgery_time
     else:
         surgery_time_dt = pd.to_datetime(surgery_time).to_pydatetime()
-    
+
     # Get patient gender
     gender = None
     if pulm_extractor.patients_df is not None:
-        patient_row = pulm_extractor.patients_df[pulm_extractor.patients_df['SUBJECT_ID'] == subject_id]
-        if not patient_row.empty and 'GENDER' in patient_row.columns:
-            gender = patient_row['GENDER'].iloc[0]
-    
+        patient_row = pulm_extractor.patients_df[
+            pulm_extractor.patients_df["SUBJECT_ID"] == subject_id
+        ]
+        if not patient_row.empty and "GENDER" in patient_row.columns:
+            gender = patient_row["GENDER"].iloc[0]
+
     # Lab names and their extraction methods
     labs_to_extract = [
-        ('hgb', 'Hemoglobin', 'hgb'),
-        ('creatinine', 'Creatinine', 'creatinine'),
-        ('bnp', 'BNP', 'bnp'),
-        ('troponin', 'Troponin', 'troponin'),
-        ('wbc', 'WBC', 'wbc'),
-        ('crp', 'CRP', 'crp'),
-        ('albumin', 'Albumin', 'albumin'),
-        ('lactate', 'Lactate', 'lactate'),
-        ('k', 'Potassium', 'k'),
-        ('na', 'Sodium', 'na'),
-        ('mg', 'Magnesium', 'mg'),
-        ('rdw', 'RDW', 'rdw'),
+        ("hgb", "Hemoglobin", "hgb"),
+        ("creatinine", "Creatinine", "creatinine"),
+        ("bnp", "BNP", "bnp"),
+        ("troponin", "Troponin", "troponin"),
+        ("wbc", "WBC", "wbc"),
+        ("crp", "CRP", "crp"),
+        ("albumin", "Albumin", "albumin"),
+        ("lactate", "Lactate", "lactate"),
+        ("k", "Potassium", "k"),
+        ("na", "Sodium", "na"),
+        ("mg", "Magnesium", "mg"),
+        ("rdw", "RDW", "rdw"),
     ]
-    
+
     # Extract labs from both extractors
     for lab_key, lab_display_name, lab_name in labs_to_extract:
         value = None
         capture_time = None
-        
+
         # Try to get from cardiac extractor first (for cardiac labs)
-        if lab_name in ['bnp', 'troponin', 'creatinine', 'hgb', 'k', 'na', 'mg', 'rdw', 'wbc']:
+        if lab_name in [
+            "bnp",
+            "troponin",
+            "creatinine",
+            "hgb",
+            "k",
+            "na",
+            "mg",
+            "rdw",
+            "wbc",
+        ]:
             if cardiac_extractor.labevents_df is not None:
                 itemids = cardiac_extractor.item_ids_cache.get(lab_name, [])
                 if itemids:
                     labs = cardiac_extractor.labevents_df[
-                        (cardiac_extractor.labevents_df['SUBJECT_ID'] == subject_id) &
-                        (cardiac_extractor.labevents_df['ITEMID'].isin(itemids))
+                        (cardiac_extractor.labevents_df["SUBJECT_ID"] == subject_id)
+                        & (cardiac_extractor.labevents_df["ITEMID"].isin(itemids))
                     ].copy()
                     if not labs.empty:
-                        labs['CHARTTIME'] = pd.to_datetime(labs['CHARTTIME'])
-                        preop_labs = labs[labs['CHARTTIME'] < surgery_time_dt]
+                        labs["CHARTTIME"] = pd.to_datetime(labs["CHARTTIME"])
+                        preop_labs = labs[labs["CHARTTIME"] < surgery_time_dt]
                         if not preop_labs.empty:
-                            preop_labs = preop_labs.sort_values('CHARTTIME', ascending=False)
-                            value = float(preop_labs['VALUENUM'].iloc[0]) if pd.notna(preop_labs['VALUENUM'].iloc[0]) else None
-                            capture_time = preop_labs['CHARTTIME'].iloc[0].to_pydatetime() if value is not None else None
-        
+                            preop_labs = preop_labs.sort_values(
+                                "CHARTTIME", ascending=False
+                            )
+                            value = (
+                                float(preop_labs["VALUENUM"].iloc[0])
+                                if pd.notna(preop_labs["VALUENUM"].iloc[0])
+                                else None
+                            )
+                            capture_time = (
+                                preop_labs["CHARTTIME"].iloc[0].to_pydatetime()
+                                if value is not None
+                                else None
+                            )
+
         # Try pulmonary extractor for pulmonary labs
-        if value is None and lab_name in ['wbc', 'crp', 'albumin', 'lactate', 'bnp']:
+        if value is None and lab_name in ["wbc", "crp", "albumin", "lactate", "bnp"]:
             if pulm_extractor.labevents_df is not None:
                 itemids = pulm_extractor.item_ids_cache.get(lab_name, [])
                 if itemids:
                     labs = pulm_extractor.labevents_df[
-                        (pulm_extractor.labevents_df['SUBJECT_ID'] == subject_id) &
-                        (pulm_extractor.labevents_df['ITEMID'].isin(itemids))
+                        (pulm_extractor.labevents_df["SUBJECT_ID"] == subject_id)
+                        & (pulm_extractor.labevents_df["ITEMID"].isin(itemids))
                     ].copy()
                     if not labs.empty:
-                        labs['CHARTTIME'] = pd.to_datetime(labs['CHARTTIME'])
-                        preop_labs = labs[labs['CHARTTIME'] < surgery_time_dt]
+                        labs["CHARTTIME"] = pd.to_datetime(labs["CHARTTIME"])
+                        preop_labs = labs[labs["CHARTTIME"] < surgery_time_dt]
                         if not preop_labs.empty:
-                            preop_labs = preop_labs.sort_values('CHARTTIME', ascending=False)
-                            value = float(preop_labs['VALUENUM'].iloc[0]) if pd.notna(preop_labs['VALUENUM'].iloc[0]) else None
-                            capture_time = preop_labs['CHARTTIME'].iloc[0].to_pydatetime() if value is not None else None
-        
+                            preop_labs = preop_labs.sort_values(
+                                "CHARTTIME", ascending=False
+                            )
+                            value = (
+                                float(preop_labs["VALUENUM"].iloc[0])
+                                if pd.notna(preop_labs["VALUENUM"].iloc[0])
+                                else None
+                            )
+                            capture_time = (
+                                preop_labs["CHARTTIME"].iloc[0].to_pydatetime()
+                                if value is not None
+                                else None
+                            )
+
         # Build lab summary entry
         if value is not None:
             normal_range = _get_lab_normal_ranges(lab_name, gender)
-            captured_ago = _format_relative_time(capture_time, surgery_time_dt) if capture_time else None
-            
+            captured_ago = (
+                _format_relative_time(capture_time, surgery_time_dt)
+                if capture_time
+                else None
+            )
+
             lab_summary[lab_key] = {
-                'name': lab_display_name,
-                'value': value,
-                'normal_range': {
-                    'min': normal_range['min'],
-                    'max': normal_range['max'],
+                "name": lab_display_name,
+                "value": value,
+                "normal_range": {
+                    "min": normal_range["min"],
+                    "max": normal_range["max"],
                 },
-                'captured_ago': captured_ago,
-                'capture_time': capture_time.isoformat() if capture_time else None,
+                "captured_ago": captured_ago,
+                "capture_time": capture_time.isoformat() if capture_time else None,
             }
-    
+
     return lab_summary
 
 
-def _calculate_rcri_fraction(components: Dict[str, Any], insulin_therapy: Optional[bool] = None) -> Optional[str]:
+def _calculate_rcri_fraction(
+    components: Dict[str, Any], insulin_therapy: Optional[bool] = None
+) -> Optional[str]:
     """
     Calculate RCRI component fraction (e.g., "2/6" or "2/5" if insulin therapy is None).
-    
+
     Counts how many of the RCRI components are True.
     If insulin_therapy is None (cannot be determined), it is excluded from the count.
-    
+
     Args:
         components: Dictionary with RCRI component flags
         insulin_therapy: Insulin therapy status (True/False/None). If None, excluded from count.
-    
+
     Returns:
         Fraction string like "2/6" or "2/5" (if insulin_therapy is None)
     """
@@ -613,10 +667,10 @@ def _calculate_rcri_fraction(components: Dict[str, Any], insulin_therapy: Option
         "creatinine_gt_2",
         "high_risk_surgery",
     ]
-    
+
     # Count standard components
     count = sum(1 for k in rcri_keys if components.get(k, False))
-    
+
     # Add insulin therapy if it's not None (i.e., if we can determine it)
     if insulin_therapy is not None:
         if insulin_therapy:
@@ -625,7 +679,7 @@ def _calculate_rcri_fraction(components: Dict[str, Any], insulin_therapy: Option
     else:
         # Insulin therapy is None (unknown), exclude from count
         total_components = 5
-    
+
     return f"{count}/{total_components}"
 
 
@@ -642,36 +696,42 @@ def _build_patient_clinical_data(
 ) -> PatientClinicalData:
     """
     Build PatientClinicalData from extracted MIMIC-III data.
-    
+
     This function aggregates data from multiple extractors into a unified
     PatientClinicalData structure for comorbidity block evaluation.
     """
     # Extract problem list (diagnoses)
     problem_list: List[ProblemListItem] = []
-    if pulm_extractor.diagnoses_icd_df is not None and pulm_extractor.d_icd_diagnoses_df is not None:
+    if (
+        pulm_extractor.diagnoses_icd_df is not None
+        and pulm_extractor.d_icd_diagnoses_df is not None
+    ):
         diagnoses = pulm_extractor.diagnoses_icd_df[
-            (pulm_extractor.diagnoses_icd_df['SUBJECT_ID'] == subject_id) &
-            (pulm_extractor.diagnoses_icd_df['HADM_ID'] == hadm_id)
+            (pulm_extractor.diagnoses_icd_df["SUBJECT_ID"] == subject_id)
+            & (pulm_extractor.diagnoses_icd_df["HADM_ID"] == hadm_id)
         ]
         if not diagnoses.empty:
-            code_col = pulm_extractor.icd_code_column or 'ICD9_CODE'
+            code_col = pulm_extractor.icd_code_column or "ICD9_CODE"
             if code_col in diagnoses.columns:
                 for _, row in diagnoses.iterrows():
                     code = str(row[code_col])
-                    name = row.get('LONG_TITLE', code) if 'LONG_TITLE' in row else code
-                    date = str(row.get('CHARTDATE', '')) if 'CHARTDATE' in row else ''
-                    problem_list.append(ProblemListItem(code=code, name=name, date=date))
-    
+                    name = row.get("LONG_TITLE", code) if "LONG_TITLE" in row else code
+                    date = str(row.get("CHARTDATE", "")) if "CHARTDATE" in row else ""
+                    problem_list.append(
+                        ProblemListItem(code=code, name=name, date=date)
+                    )
+
     # Extract medications (placeholder - MIMIC-III doesn't have structured medication data)
     # In real implementation, this would come from PRESCRIPTIONS or INPUTEVENTS_MV
     medications: List[MedicationItem] = []
     # TODO: Extract from prescriptions table if available
-    
+
     # Extract lab values
     cardiac_labs = cardiac_report.get("labs", {}) or {}
     pulm_labs = enhanced_pulm.get("lab_risk", {}) or {}
     lab_values = LabValues(
-        hemoglobin=pulm_labs.get("hgb") or cardiac_labs.get("anemia", {}).get("hgb_last"),
+        hemoglobin=pulm_labs.get("hgb")
+        or cardiac_labs.get("anemia", {}).get("hgb_last"),
         a1c=None,  # Not extracted in current implementation
         creatinine=cardiac_labs.get("creatinine", {}).get("last"),
         albumin=pulm_labs.get("albumin"),
@@ -685,7 +745,7 @@ def _build_patient_clinical_data(
         ferritin=None,  # Not extracted in current implementation
         tsat=None,  # Not extracted in current implementation
     )
-    
+
     # Extract vital signs
     bp = None
     if recent_vital_signs.get("blood_pressure"):
@@ -700,55 +760,65 @@ def _build_patient_clinical_data(
         spo2=recent_vital_signs.get("spo2") or enhanced_pulm.get("preop_spo2"),
         temperature=recent_vital_signs.get("temperature"),
     )
-    
+
     # Extract devices (placeholder - would come from device-specific tables)
     devices: List[str] = []
     # Check for pacemaker/ICD from diagnoses or procedures
     if pulm_extractor.diagnoses_icd_df is not None:
         device_diag = pulm_extractor.diagnoses_icd_df[
-            (pulm_extractor.diagnoses_icd_df['SUBJECT_ID'] == subject_id) &
-            (pulm_extractor.diagnoses_icd_df['HADM_ID'] == hadm_id)
+            (pulm_extractor.diagnoses_icd_df["SUBJECT_ID"] == subject_id)
+            & (pulm_extractor.diagnoses_icd_df["HADM_ID"] == hadm_id)
         ]
         if not device_diag.empty:
-            code_col = pulm_extractor.icd_code_column or 'ICD9_CODE'
+            code_col = pulm_extractor.icd_code_column or "ICD9_CODE"
             if code_col in device_diag.columns:
                 codes = device_diag[code_col].astype(str).str.lower()
-                if codes.str.contains('pacemaker|icd|implantable', case=False, na=False).any():
-                    devices.append('pacemaker')
-                    devices.append('ICD')
-    
+                if codes.str.contains(
+                    "pacemaker|icd|implantable", case=False, na=False
+                ).any():
+                    devices.append("pacemaker")
+                    devices.append("ICD")
+
     # Extract demographics
     age = None
     sex = None
     bmi = None
     if pulm_extractor.patients_df is not None:
-        patient = pulm_extractor.patients_df[pulm_extractor.patients_df['SUBJECT_ID'] == subject_id]
+        patient = pulm_extractor.patients_df[
+            pulm_extractor.patients_df["SUBJECT_ID"] == subject_id
+        ]
         if not patient.empty:
-            sex = patient['GENDER'].iloc[0] if 'GENDER' in patient.columns else None
+            sex = patient["GENDER"].iloc[0] if "GENDER" in patient.columns else None
     if pulm_extractor.admissions_df is not None:
-        adm = pulm_extractor.admissions_df[pulm_extractor.admissions_df['HADM_ID'] == hadm_id]
+        adm = pulm_extractor.admissions_df[
+            pulm_extractor.admissions_df["HADM_ID"] == hadm_id
+        ]
         if not adm.empty and pulm_extractor.patients_df is not None:
-            patient = pulm_extractor.patients_df[pulm_extractor.patients_df['SUBJECT_ID'] == subject_id]
+            patient = pulm_extractor.patients_df[
+                pulm_extractor.patients_df["SUBJECT_ID"] == subject_id
+            ]
             if not patient.empty:
-                dob = pd.to_datetime(patient['DOB'].iloc[0])
-                admittime = pd.to_datetime(adm['ADMITTIME'].iloc[0])
+                dob = pd.to_datetime(patient["DOB"].iloc[0])
+                admittime = pd.to_datetime(adm["ADMITTIME"].iloc[0])
                 age = int((admittime - dob).days / 365.25)
-    
+
     demographics = Demographics(
         age=age,
         sex=sex,
         bmi=bmi,
         smokingStatus=None,  # Would need to extract from chartevents/noteevents
     )
-    
+
     # Extract HPI red flags
     hpi_flags = HpiRedFlags(
         chestPain=hpi_red_flags.get("chestPain", {}).get("present", False),
-        shortnessOfBreath=hpi_red_flags.get("shortnessOfBreath", {}).get("present", False),
+        shortnessOfBreath=hpi_red_flags.get("shortnessOfBreath", {}).get(
+            "present", False
+        ),
         syncope=False,  # Not extracted in current implementation
         fever=False,  # Not extracted in current implementation
     )
-    
+
     return PatientClinicalData(
         problemList=problem_list,
         medications=medications,
@@ -776,21 +846,21 @@ def _evaluate_comorbidity_blocks(
 ) -> List[Dict[str, Any]]:
     """
     Evaluate all configured comorbidity blocks against patient clinical data.
-    
+
     Returns a list of TriggerEvaluationResult dictionaries (serialized for JSON).
     """
     results: List[Dict[str, Any]] = []
-    
+
     # Get all configured comorbidity blocks
     blocks = get_all_comorbidity_blocks()
-    
+
     # Special handling for CKD block: calculate eGFR if creatinine available
     # This needs to be done before evaluation since eGFR is not directly in LabValues
     # We'll handle this in the evaluation by checking eGFR thresholds
-    
+
     for block in blocks:
         evaluation_result = evaluate_trigger(block, patient_clinical_data)
-        
+
         # Special handling for CKD: check eGFR threshold
         if block.blockId == "CKD_001":
             egfr = calculate_egfr_ckd_epi(
@@ -817,22 +887,28 @@ def _evaluate_comorbidity_blocks(
                         blockId=evaluation_result.blockId,
                         triggered=True,
                         triggerReasons=new_reasons,
-                        confidenceScore=min(1.0, evaluation_result.confidenceScore + 0.1),
+                        confidenceScore=min(
+                            1.0, evaluation_result.confidenceScore + 0.1
+                        ),
                         riskLevel=evaluation_result.riskLevel,
                         requiredActions=list(evaluation_result.requiredActions),
                     )
-        
+
         # Apply risk stratification if block is triggered
         refined_risk_level = evaluation_result.riskLevel
         personalized_content = None
-        
+
         if evaluation_result.triggered:
-            refined_risk_level = assess_risk_level(block, patient_clinical_data, evaluation_result)
-            risk_specific_recommendations = get_risk_specific_recommendations(block, refined_risk_level)
-            
+            refined_risk_level = assess_risk_level(
+                block, patient_clinical_data, evaluation_result
+            )
+            risk_specific_recommendations = get_risk_specific_recommendations(
+                block, refined_risk_level
+            )
+
             # Determine procedure bleed risk (simplified - would come from procedure chips in production)
             procedure_bleed_risk = _infer_procedure_bleed_risk(surg_ctx)
-            
+
             # Generate personalized content
             personalized_content = generate_personalized_content(
                 block=block,
@@ -841,7 +917,7 @@ def _evaluate_comorbidity_blocks(
                 confidence_tier=evaluation_result.confidenceTier,
                 procedure_bleed_risk=procedure_bleed_risk,
             )
-            
+
             # Update evaluation result with refined risk level
             evaluation_result = TriggerEvaluationResult(
                 blockId=evaluation_result.blockId,
@@ -849,9 +925,10 @@ def _evaluate_comorbidity_blocks(
                 triggerReasons=evaluation_result.triggerReasons,
                 confidenceScore=evaluation_result.confidenceScore,
                 riskLevel=refined_risk_level,
-                requiredActions=evaluation_result.requiredActions + risk_specific_recommendations,
+                requiredActions=evaluation_result.requiredActions
+                + risk_specific_recommendations,
             )
-        
+
         # Serialize to dictionary for JSON output
         result_dict = {
             "blockId": evaluation_result.blockId,
@@ -884,7 +961,7 @@ def _evaluate_comorbidity_blocks(
             },
             "version": block.version,
         }
-        
+
         # Add personalized content if available
         if personalized_content:
             result_dict["personalizedContent"] = {
@@ -893,9 +970,9 @@ def _evaluate_comorbidity_blocks(
                 "fullContent": personalized_content.fullContent,
                 "versionFooter": personalized_content.versionFooter,
             }
-        
+
         results.append(result_dict)
-    
+
     return results
 
 
@@ -903,40 +980,54 @@ def _infer_procedure_bleed_risk(surg_ctx: Optional[Dict[str, Any]]) -> Optional[
     """
     Infer procedure bleed risk from surgery context.
     In production, this would come from Barnabus procedure chips.
-    
+
     Args:
         surg_ctx: Surgery context dictionary
-    
+
     Returns:
         'low', 'moderate', 'high', or None
     """
     if not surg_ctx:
         return None
-    
-    surgery_type = surg_ctx.get("planned_surgery_type", "").lower()
-    procedure_name = surg_ctx.get("primary_procedure_name", "").lower()
-    
+
+    surgery_type = (surg_ctx.get("planned_surgery_type") or "").lower()
+    procedure_name = (surg_ctx.get("primary_procedure_name") or "").lower()
+
     # High bleed risk procedures
     high_bleed_keywords = [
-        'cardiac', 'vascular', 'major abdominal', 'liver', 'spleen',
-        'prostate', 'bladder', 'kidney', 'neurosurgery', 'spine',
-        'orthopedic major', 'joint replacement'
+        "cardiac",
+        "vascular",
+        "major abdominal",
+        "liver",
+        "spleen",
+        "prostate",
+        "bladder",
+        "kidney",
+        "neurosurgery",
+        "spine",
+        "orthopedic major",
+        "joint replacement",
     ]
-    
+
     # Low bleed risk procedures
     low_bleed_keywords = [
-        'cataract', 'endoscopy', 'colonoscopy', 'minor', 'superficial',
-        'dermatology', 'ophthalmology'
+        "cataract",
+        "endoscopy",
+        "colonoscopy",
+        "minor",
+        "superficial",
+        "dermatology",
+        "ophthalmology",
     ]
-    
+
     combined_text = f"{surgery_type} {procedure_name}"
-    
+
     if any(keyword in combined_text for keyword in high_bleed_keywords):
-        return 'high'
+        return "high"
     elif any(keyword in combined_text for keyword in low_bleed_keywords):
-        return 'low'
+        return "low"
     else:
-        return 'moderate'  # Default to moderate if unclear
+        return "moderate"  # Default to moderate if unclear
 
 
 def _collect_assumptions() -> List[str]:
@@ -1021,12 +1112,22 @@ def integrate_cardiac_and_pulmonary_risk(
     # Extract ARISCAT information (Barnabus-compatible)
     ariscat = enhanced_pulm.get("ariscat", {}) or {}
     ariscat_score = ariscat.get("score") or ariscat.get("ariscat_score")
-    ariscat_cat_raw = (ariscat.get("risk_category") or ariscat.get("risk_level") or "") or None
+    ariscat_cat_raw = (
+        ariscat.get("risk_category") or ariscat.get("risk_level") or ""
+    ) or None
     # Normalize ARISCAT risk category to Barnabus-style title case
     if ariscat_cat_raw:
         cat_lower = str(ariscat_cat_raw).lower()
         if cat_lower in {"low", "intermediate", "moderate"}:
-            ariscat_cat = "Low" if cat_lower == "low" else ("Intermediate" if cat_lower in {"intermediate", "moderate"} else "High")
+            ariscat_cat = (
+                "Low"
+                if cat_lower == "low"
+                else (
+                    "Intermediate"
+                    if cat_lower in {"intermediate", "moderate"}
+                    else "High"
+                )
+            )
         elif cat_lower in {"high"}:
             ariscat_cat = "High"
         else:
@@ -1034,7 +1135,7 @@ def integrate_cardiac_and_pulmonary_risk(
     else:
         ariscat_cat = None
     pulm_overall_cat = enhanced_pulm.get("overall_risk_category")
-    
+
     # Extract ARISCAT component flags and effective input values from risk_factors
     ariscat_flags: Dict[str, Any] = {}
     ariscat_effective_inputs: Dict[str, Any] = {}
@@ -1083,7 +1184,9 @@ def integrate_cardiac_and_pulmonary_risk(
                 ariscat_missing_inputs.append(key)
 
         # Respiratory infection
-        prior_resp = pulmonary_risk_factors.get("prior_respiratory_admissions", {}) or {}
+        prior_resp = (
+            pulmonary_risk_factors.get("prior_respiratory_admissions", {}) or {}
+        )
         resp_diagnoses = pulmonary_risk_factors.get("respiratory_diagnoses", {}) or {}
         has_resp_infection = (
             prior_resp.get("prior_pneumonia", False)
@@ -1106,34 +1209,38 @@ def integrate_cardiac_and_pulmonary_risk(
         }
 
         # Surgery duration > 2h
-        ariscat_flags["surgery_duration_gt_2h"] = duration_hours is not None and duration_hours > 2.0
+        ariscat_flags["surgery_duration_gt_2h"] = (
+            duration_hours is not None and duration_hours > 2.0
+        )
 
         # Emergency surgery
         ariscat_flags["emergency_surgery"] = bool(emergency)
 
         # Asthma (for general pulmonary flags)
         ariscat_flags["asthma"] = resp_diagnoses.get("asthma", False)
-    
+
     # Calculate COPD risk tier
     copd_risk_tier = None
     if pulmonary_risk_factors:
-        resp_diagnoses = pulmonary_risk_factors.get('respiratory_diagnoses')
-        
+        resp_diagnoses = pulmonary_risk_factors.get("respiratory_diagnoses")
+
         # Check if diagnosis data is available
         # If resp_diagnoses is None or empty dict, we can't determine COPD status
         if resp_diagnoses is not None:
-            copd_diagnosis = resp_diagnoses.get('copd')  # Can be True, False, or None
-            spo2 = pulmonary_risk_factors.get('preop_spo2')
-            prior_resp = pulmonary_risk_factors.get('prior_respiratory_admissions', {}) or {}
-            smoking_status = pulmonary_risk_factors.get('smoking_status')
+            copd_diagnosis = resp_diagnoses.get("copd")  # Can be True, False, or None
+            spo2 = pulmonary_risk_factors.get("preop_spo2")
+            prior_resp = (
+                pulmonary_risk_factors.get("prior_respiratory_admissions", {}) or {}
+            )
+            smoking_status = pulmonary_risk_factors.get("smoking_status")
             copd_risk_tier = _calculate_copd_risk_tier(
                 copd_diagnosis=copd_diagnosis,
                 spo2=spo2,
                 prior_respiratory_admissions=prior_resp,
-                smoking_status=smoking_status
+                smoking_status=smoking_status,
             )
         # If resp_diagnoses is None, copd_risk_tier remains None (cannot determine)
-    
+
     # Determine ARISCAT completeness state and PPC percentage.
     # If the ARISCAT module was able to compute a score, we treat the inputs as
     # effectively complete for Barnabus purposes, even if some fields in our
@@ -1155,10 +1262,10 @@ def integrate_cardiac_and_pulmonary_risk(
         "bnp": pulm_lab_risk.get("bnp"),
         "albumin": pulm_lab_risk.get("albumin"),
     }
-    
+
     # Cardiac calculators - build structure for each
     cardiac_calculators = {}
-    
+
     # RCRI
     rcri_res = scores.get("rcri")
     if rcri_res:
@@ -1177,8 +1284,10 @@ def integrate_cardiac_and_pulmonary_risk(
             "High-risk surgery": rcri_comps.get("high_risk_surgery", False),
         }
         rcri_score = rcri_res.get("score")
-        rcri_cat = rcri_comps.get("temporal_adjusted_category") or rcri_comps.get("risk_category")
-        
+        rcri_cat = rcri_comps.get("temporal_adjusted_category") or rcri_comps.get(
+            "risk_category"
+        )
+
         # Build RCRI factors list with TRUE/FALSE values
         # Note: According to RCRI, the component is "insulin therapy for diabetes", not just "diabetes"
         # Insulin therapy cannot be directly detected from available MIMIC-III data
@@ -1194,7 +1303,7 @@ def integrate_cardiac_and_pulmonary_risk(
         else:
             # No diabetes = no insulin therapy
             insulin_therapy = False
-        
+
         rcri_factors = {
             "High_risk_surgery": rcri_comps.get("high_risk_surgery", False),
             "Ischemic_heart_disease": rcri_comps.get("ischemic_heart_disease", False),
@@ -1203,27 +1312,37 @@ def integrate_cardiac_and_pulmonary_risk(
             "Cerebrovascular_disease": rcri_comps.get("stroke_tia", False),
             "Preop_creatine>2_mg/dl": rcri_comps.get("creatinine_gt_2", False),
         }
-        
+
         cardiac_calculators["RCRI"] = {
             "score": rcri_score,
-            "score_percentage": round(_calculate_score_percentage("RCRI", rcri_score), 1) if rcri_score is not None else None,
+            "score_percentage": (
+                round(_calculate_score_percentage("RCRI", rcri_score), 1)
+                if rcri_score is not None
+                else None
+            ),
             "component_fraction": _calculate_rcri_fraction(rcri_comps, insulin_therapy),
             "risk_tier": _normalize_risk_tier(rcri_cat),
             "factors": rcri_factors,
         }
-    
+
     # AUB-HAS-2
     aub_res = scores.get("aub_has2")
     if aub_res:
         aub_comps = aub_res.get("components", {})
         aub_score = aub_res.get("score")
-        aub_cat = aub_comps.get("temporal_adjusted_category") or aub_comps.get("risk_category")
+        aub_cat = aub_comps.get("temporal_adjusted_category") or aub_comps.get(
+            "risk_category"
+        )
         cardiac_calculators["AUB-HAS-2"] = {
             "score": aub_score,
-            "score_percentage": round(_calculate_score_percentage("AUB-HAS-2", aub_score), 1) if aub_score is not None else None,
+            "score_percentage": (
+                round(_calculate_score_percentage("AUB-HAS-2", aub_score), 1)
+                if aub_score is not None
+                else None
+            ),
             "risk_tier": _normalize_risk_tier(aub_cat),
         }
-    
+
     # NSQIP MACE
     nsqip_res = scores.get("nsqip_mace")
     if nsqip_res:
@@ -1232,10 +1351,14 @@ def integrate_cardiac_and_pulmonary_risk(
         nsqip_cat = nsqip_comps.get("risk_category")
         cardiac_calculators["NSQIP_MACE"] = {
             "score": nsqip_score,
-            "score_percentage": round(_calculate_score_percentage("NSQIP_MACE", nsqip_score), 1) if nsqip_score is not None else None,
+            "score_percentage": (
+                round(_calculate_score_percentage("NSQIP_MACE", nsqip_score), 1)
+                if nsqip_score is not None
+                else None
+            ),
             "risk_tier": _normalize_risk_tier(nsqip_cat),
         }
-    
+
     # Gupta MICA
     gupta_res = scores.get("gupta_mica")
     if gupta_res:
@@ -1244,25 +1367,33 @@ def integrate_cardiac_and_pulmonary_risk(
         gupta_cat = gupta_comps.get("risk_category")
         cardiac_calculators["Gupta_MICA"] = {
             "score": gupta_score,
-            "score_percentage": round(_calculate_score_percentage("Gupta_MICA", gupta_score), 1) if gupta_score is not None else None,
+            "score_percentage": (
+                round(_calculate_score_percentage("Gupta_MICA", gupta_score), 1)
+                if gupta_score is not None
+                else None
+            ),
             "risk_tier": _normalize_risk_tier(gupta_cat),
         }
-    
+
     # Determine overall cardiac risk category (use RCRI if available, else AUB-HAS-2)
     cardiac_overall_cat = None
     if rcri_res:
         rcri_comps = rcri_res.get("components", {})
-        cardiac_overall_cat = rcri_comps.get("temporal_adjusted_category") or rcri_comps.get("risk_category")
+        cardiac_overall_cat = rcri_comps.get(
+            "temporal_adjusted_category"
+        ) or rcri_comps.get("risk_category")
     elif aub_res:
         aub_comps = aub_res.get("components", {})
-        cardiac_overall_cat = aub_comps.get("temporal_adjusted_category") or aub_comps.get("risk_category")
-    
+        cardiac_overall_cat = aub_comps.get(
+            "temporal_adjusted_category"
+        ) or aub_comps.get("risk_category")
+
     # Normalize overall cardiac risk tier
     cardiac_overall_tier = _normalize_risk_tier(cardiac_overall_cat)
-    
+
     # Build cardiac consensus for confidence calculation (not included in output)
     cardiac_consensus = _build_cardiac_consensus(scores)
-    
+
     # Build shared cardiac lab_risk (using RCRI flags as primary, or general cardiac labs)
     cardiac_labs_shared = cardiac_report.get("labs", {}) or {}
     cardiac_lab_values_shared = {
@@ -1284,16 +1415,18 @@ def integrate_cardiac_and_pulmonary_risk(
             "High-risk surgery": rcri_comps.get("high_risk_surgery", False),
         }
     # Add lab-based flags (wbc_abnormal and elevated BNP indicating heart failure)
-    cardiac_flags_shared["wbc_abnormal"] = cardiac_wbc is not None and (cardiac_wbc < 4 or cardiac_wbc > 12)
-    # Note: heart_failure above is from RCRI components (diagnoses), 
+    cardiac_flags_shared["wbc_abnormal"] = cardiac_wbc is not None and (
+        cardiac_wbc < 4 or cardiac_wbc > 12
+    )
+    # Note: heart_failure above is from RCRI components (diagnoses),
     # BNP > 300 also suggests heart failure but we keep the RCRI component flag as primary
     if cardiac_bnp is not None and cardiac_bnp > 300:
         # If BNP is elevated, ensure heart_failure flag is True (combines diagnosis + lab evidence)
         cardiac_flags_shared["heart_failure"] = True
-    
+
     # Get temporal patterns
     cardiac_temporal = cardiac_report.get("cardiac_temporal_patterns", {})
-    
+
     # Build hepatic VOCAL-Penn inputs using available data (best-effort).
     pulmonary_albumin = pulm_lab_values.get("albumin")
     # Use creatinine, sodium, INR, platelets, bilirubin from cardiac lab intelligence if available
@@ -1303,15 +1436,15 @@ def integrate_cardiac_and_pulmonary_risk(
     inr_last = None
     platelets_last = None
     bilirubin_last = None
-    
+
     # Creatinine from renal_trend (now includes last value)
     renal_trend = cardiac_labs.get("renal_trend", {}) or {}
     creat_last = renal_trend.get("last")
-    
+
     # Sodium from electrolytes
     electrolytes = cardiac_labs.get("electrolytes", {}) or {}
     na_last = electrolytes.get("na")
-    
+
     # Hepatic labs (INR, platelets, bilirubin)
     hepatic_labs = cardiac_labs.get("hepatic", {}) or {}
     inr_last = hepatic_labs.get("inr_last")
@@ -1320,7 +1453,11 @@ def integrate_cardiac_and_pulmonary_risk(
 
     hepatic_inputs = VocalPennInputs(
         asaClass=3,  # cannot derive ASA class from MIMIC subset; default to 3
-        age=pulmonary_risk_factors.get("age_at_surgery") if pulmonary_risk_factors else None,
+        age=(
+            pulmonary_risk_factors.get("age_at_surgery")
+            if pulmonary_risk_factors
+            else None
+        ),
         ascitesPresent=False,  # ascites not explicitly modeled in this backend
         albumin=pulmonary_albumin,
         inr=inr_last,
@@ -1361,7 +1498,9 @@ def integrate_cardiac_and_pulmonary_risk(
                 "ppc_risk_percent": ariscat_ppc,
                 "contributors": ariscat.get("contributors", []),
                 "normalized_tier": ariscat_cat,
-                "completeness": "complete" if ariscat_state == "complete" else "incomplete",
+                "completeness": (
+                    "complete" if ariscat_state == "complete" else "incomplete"
+                ),
                 "missing_inputs": ariscat_missing_inputs or None,
                 "input_snapshot": {
                     "effective_values": ariscat_effective_inputs,
@@ -1447,7 +1586,9 @@ def integrate_cardiac_and_pulmonary_risk(
         ev_list = prior_events.get(bucket, []) or []
         for ev in ev_list:
             postfix = (
-                " (possibly post-operative)" if ev.get("post_operative_heuristic") else ""
+                " (possibly post-operative)"
+                if ev.get("post_operative_heuristic")
+                else ""
             )
             event_entries.append(
                 f"{label} (HADM {ev.get('hadm_id')}, {ev.get('date')}){postfix}"
@@ -1505,10 +1646,14 @@ def integrate_cardiac_and_pulmonary_risk(
     aub_res = scores.get("aub_has2")
     if rcri_res:
         comps = rcri_res.get("components", {})
-        cardiac_cat = comps.get("temporal_adjusted_category") or comps.get("risk_category")
+        cardiac_cat = comps.get("temporal_adjusted_category") or comps.get(
+            "risk_category"
+        )
     elif aub_res:
         comps = aub_res.get("components", {})
-        cardiac_cat = comps.get("temporal_adjusted_category") or comps.get("risk_category")
+        cardiac_cat = comps.get("temporal_adjusted_category") or comps.get(
+            "risk_category"
+        )
     else:
         cardiac_cat = None
 
@@ -1558,12 +1703,8 @@ def integrate_cardiac_and_pulmonary_risk(
     cardiac_confidence = round(
         0.4 * cardiac_cat_score + 0.3 * data_completeness + 0.3 * consensus_factor, 3
     )
-    pulmonary_confidence = round(
-        0.6 * pulm_cat_score + 0.4 * data_completeness, 3
-    )
-    overall_confidence = round(
-        0.5 * cardiac_confidence + 0.5 * pulmonary_confidence, 3
-    )
+    pulmonary_confidence = round(0.6 * pulm_cat_score + 0.4 * data_completeness, 3)
+    overall_confidence = round(0.5 * cardiac_confidence + 0.5 * pulmonary_confidence, 3)
 
     # ---------------- recommendations (prioritized) ----------------
     recommendations: List[str] = []
@@ -1624,7 +1765,7 @@ def integrate_cardiac_and_pulmonary_risk(
             "No specific high-risk cardiac red flags identified; proceed per standard institutional protocol."
         )
 
-    # ---------------- Recent Vital Signs (pre-operative) ---------------- 
+    # ---------------- Recent Vital Signs (pre-operative) ----------------
     recent_vital_signs = _extract_recent_vital_signs(
         pulm_extractor=pulm_extractor,
         subject_id=subject_id,
@@ -1632,7 +1773,7 @@ def integrate_cardiac_and_pulmonary_risk(
         surgery_time=surgery_time,
     )
 
-    # ---------------- Lab Summary (with normal ranges and capture times) ---------------- 
+    # ---------------- Lab Summary (with normal ranges and capture times) ----------------
     lab_summary = _extract_lab_summary(
         pulm_extractor=pulm_extractor,
         cardiac_extractor=cardiac_extractor,
@@ -1641,7 +1782,7 @@ def integrate_cardiac_and_pulmonary_risk(
         surgery_time=surgery_time,
     )
 
-    # ---------------- HPI Red-Flags placeholder (for Barnabus integration) ---------------- 
+    # ---------------- HPI Red-Flags placeholder (for Barnabus integration) ----------------
     # This backend does not extract HPI from MIMIC-III; we expose a stable block
     # so that downstream Barnabus services can overlay real HPI data.
     hpi_red_flags = {
@@ -1654,7 +1795,7 @@ def integrate_cardiac_and_pulmonary_risk(
         "acknowledgment": None,
     }
 
-    # ---------------- Comorbidity Blocks Evaluation ---------------- 
+    # ---------------- Comorbidity Blocks Evaluation ----------------
     # Build PatientClinicalData from extracted data
     patient_clinical_data = _build_patient_clinical_data(
         pulm_extractor=pulm_extractor,
@@ -1667,107 +1808,133 @@ def integrate_cardiac_and_pulmonary_risk(
         recent_vital_signs=recent_vital_signs,
         hpi_red_flags=hpi_red_flags,
     )
-    
+
     # Evaluate comorbidity blocks (using example CAD/CHF block for now)
     comorbidity_blocks = _evaluate_comorbidity_blocks(
         patient_clinical_data=patient_clinical_data,
         surg_ctx=surg_ctx,
     )
-    
+
     # Merge triggered blocks to remove duplicates and resolve conflicts
-    triggered_blocks = [b for b in comorbidity_blocks if b.get('triggered', False)]
+    triggered_blocks = [b for b in comorbidity_blocks if b.get("triggered", False)]
     merged_content: Optional[MergedContent] = None
     if len(triggered_blocks) > 1:
         merged_content = merge_blocks(triggered_blocks)
-    
+
     # Generate decision support recommendations
     clinical_recommendations: Optional[ClinicalRecommendations] = None
     if triggered_blocks:
-        clinical_recommendations = generate_recommendations(triggered_blocks, patient_clinical_data)
+        clinical_recommendations = generate_recommendations(
+            triggered_blocks, patient_clinical_data
+        )
 
-    # ---------------- Clinical Change Detection ---------------- 
+    # ---------------- Clinical Change Detection ----------------
     change_analysis_result = None
     change_summary_result = None
     clinical_patterns_result = []
-    
+
     if surgery_time:
         try:
             # Prepare lab series data for change detection
             lab_series_dict = {}
             lab_value_series_list = []
-            
+
             # Common labs to analyze
-            lab_names = ['creatinine', 'bnp', 'troponin', 'hemoglobin', 'sodium', 'potassium', 
-                        'glucose', 'albumin', 'platelets', 'inr']
-            
+            lab_names = [
+                "creatinine",
+                "bnp",
+                "troponin",
+                "hemoglobin",
+                "sodium",
+                "potassium",
+                "glucose",
+                "albumin",
+                "platelets",
+                "inr",
+            ]
+
             for lab_name in lab_names:
                 # Get lab series from cardiac extractor
                 lab_series = cardiac_extractor._get_lab_series_by_time_window(
                     subject_id=subject_id,
                     lab_name=lab_name,
                     anchor_time=surgery_time,
-                    hours_before=168  # 7 days
+                    hours_before=168,  # 7 days
                 )
-                
+
                 if lab_series is not None and not lab_series.empty:
                     # Filter to pre-op only and ensure valid values
-                    lab_series = lab_series[lab_series['CHARTTIME'] < pd.to_datetime(surgery_time)].copy()
-                    lab_series = lab_series[lab_series['VALUENUM'].notna()].copy()
-                    
+                    lab_series = lab_series[
+                        lab_series["CHARTTIME"] < pd.to_datetime(surgery_time)
+                    ].copy()
+                    lab_series = lab_series[lab_series["VALUENUM"].notna()].copy()
+
                     if not lab_series.empty:
                         lab_series_dict[lab_name] = lab_series
-                        
+
                         # Create LabValueSeries for temporal features
-                        values = lab_series['VALUENUM'].tolist()
-                        timestamps = [ts.isoformat() if isinstance(ts, pd.Timestamp) else str(ts) 
-                                     for ts in lab_series['CHARTTIME'].tolist()]
-                        
+                        values = lab_series["VALUENUM"].tolist()
+                        timestamps = [
+                            ts.isoformat() if isinstance(ts, pd.Timestamp) else str(ts)
+                            for ts in lab_series["CHARTTIME"].tolist()
+                        ]
+
                         # Get unit from first row if available
                         unit = None
-                        if 'VALUEUOM' in lab_series.columns:
-                            unit = lab_series['VALUEUOM'].iloc[0] if not lab_series['VALUEUOM'].isna().iloc[0] else None
-                        
+                        if "VALUEUOM" in lab_series.columns:
+                            unit = (
+                                lab_series["VALUEUOM"].iloc[0]
+                                if not lab_series["VALUEUOM"].isna().iloc[0]
+                                else None
+                            )
+
                         lab_value_series_list.append(
                             LabValueSeries(
                                 testName=lab_name,
                                 values=values,
                                 timestamps=timestamps,
-                                unit=unit
+                                unit=unit,
                             )
                         )
-            
+
             # Run change detection if we have lab data
             if lab_series_dict:
                 change_detector = SurgeryAwareChangeDetector(
                     surgery_datetime=surgery_time,
                     lab_trend_data=None,  # Will be populated from lab series
-                    temporal_patterns=None
+                    temporal_patterns=None,
                 )
-                
+
                 # Analyze changes
                 unified_analysis = change_detector.analyze_changes(
                     subject_id=subject_id,
                     hadm_id=hadm_id,
                     lab_series=lab_series_dict,
-                    max_hours_before=168  # 7 days
+                    max_hours_before=168,  # 7 days
                 )
-                
+
                 # Convert to ChangeAnalysis format
                 # Create analysis window
                 analysis_window = AnalysisWindow(
-                    start=(pd.to_datetime(surgery_time) - pd.Timedelta(days=7)).isoformat(),
-                    end=surgery_time.isoformat() if isinstance(surgery_time, datetime) else str(surgery_time),
-                    durationDays=7.0
+                    start=(
+                        pd.to_datetime(surgery_time) - pd.Timedelta(days=7)
+                    ).isoformat(),
+                    end=(
+                        surgery_time.isoformat()
+                        if isinstance(surgery_time, datetime)
+                        else str(surgery_time)
+                    ),
+                    durationDays=7.0,
                 )
-                
+
                 # Convert changes from legacy format to ClinicalChange format
                 clinical_changes = []
                 for change_result in unified_analysis.changes:
                     # Convert QuantitativeDelta to ClinicalChange
                     delta = change_result.quantitative_delta
-                    
+
                     # Determine change type and category
-                    
+
                     # Create quantitative data
                     quantitative_data = QuantitativeData(
                         testName=delta.parameter_name,
@@ -1776,9 +1943,9 @@ def integrate_cardiac_and_pulmonary_risk(
                         unit=None,  # Unit not available in legacy format
                         delta=delta.delta_value,
                         percentChange=delta.delta_percent,
-                        rateOfChange=None
+                        rateOfChange=None,
                     )
-                    
+
                     # Determine risk change
                     if delta.delta_value is not None:
                         if delta.delta_value > 0:
@@ -1789,13 +1956,17 @@ def integrate_cardiac_and_pulmonary_risk(
                             risk_change = RiskChange.NEUTRAL
                     else:
                         risk_change = RiskChange.NEUTRAL
-                    
+
                     # Map lab to category (using module function)
                     lab_category = ccd_module._map_lab_to_category(delta.parameter_name)
-                    
+
                     # Create clinical change
                     clinical_change = ClinicalChange(
-                        timestamp=delta.current_timestamp.isoformat() if delta.current_timestamp else datetime.now().isoformat(),
+                        timestamp=(
+                            delta.current_timestamp.isoformat()
+                            if delta.current_timestamp
+                            else datetime.now().isoformat()
+                        ),
                         type=ChangeType.LAB,
                         category=lab_category,
                         description=f"{delta.parameter_name} changed from {delta.baseline_value} to {delta.current_value}",
@@ -1803,12 +1974,13 @@ def integrate_cardiac_and_pulmonary_risk(
                         criticality=delta.clinical_significance.value,
                         clinicalImpact=ClinicalImpact(
                             riskChange=risk_change,
-                            affectsSurgicalPlanning=delta.clinical_significance.value in ['P0', 'P1'],
-                            requiresAction=delta.clinical_significance.value == 'P0'
-                        )
+                            affectsSurgicalPlanning=delta.clinical_significance.value
+                            in ["P0", "P1"],
+                            requiresAction=delta.clinical_significance.value == "P0",
+                        ),
                     )
                     clinical_changes.append(clinical_change)
-                
+
                 # Create integrated trends from lab series
                 integrated_trends = []
                 for lab_series_item in lab_value_series_list:
@@ -1817,78 +1989,95 @@ def integrate_cardiac_and_pulmonary_risk(
                         previous_value = lab_series_item.values[0]
                         current_value = lab_series_item.values[-1]
                         delta = current_value - previous_value
-                        
+
                         # Determine trend direction
                         if delta > 0:
-                            trend_direction = 'increasing'
+                            trend_direction = "increasing"
                         elif delta < 0:
-                            trend_direction = 'decreasing'
+                            trend_direction = "decreasing"
                         else:
-                            trend_direction = 'stable'
-                        
+                            trend_direction = "stable"
+
                         # Calculate temporal features (using module functions)
-                        acceleration = ccd_module._calculate_acceleration(lab_series_item.values)
-                        volatility = ccd_module._calculate_volatility(lab_series_item.values)
-                        diurnal_pattern = ccd_module._detect_diurnal_pattern_enhanced(
-                            lab_series_item.timestamps,
+                        acceleration = ccd_module._calculate_acceleration(
                             lab_series_item.values
                         )
-                        outlier_count = ccd_module._count_outliers(lab_series_item.values)
-                        
+                        volatility = ccd_module._calculate_volatility(
+                            lab_series_item.values
+                        )
+                        diurnal_pattern = ccd_module._detect_diurnal_pattern_enhanced(
+                            lab_series_item.timestamps, lab_series_item.values
+                        )
+                        outlier_count = ccd_module._count_outliers(
+                            lab_series_item.values
+                        )
+
                         temporal_features = TemporalFeatures(
                             acceleration=acceleration,
                             volatility=volatility,
                             seasonality=diurnal_pattern,
-                            outlierCount=outlier_count
+                            outlierCount=outlier_count,
                         )
-                        
+
                         integrated_trend = IntegratedTrend(
                             parameterName=lab_series_item.testName,
                             test=lab_series_item.testName,
                             trendDirection=trend_direction,
-                            confidence='high' if len(lab_series_item.values) >= 3 else 'moderate',
-                            dataSources=['lab_series'],
+                            confidence=(
+                                "high"
+                                if len(lab_series_item.values) >= 3
+                                else "moderate"
+                            ),
+                            dataSources=["lab_series"],
                             trendDetails={
-                                'delta': delta,
-                                'previousValue': previous_value,
-                                'currentValue': current_value
+                                "delta": delta,
+                                "previousValue": previous_value,
+                                "currentValue": current_value,
                             },
-                            temporalFeatures=temporal_features
+                            temporalFeatures=temporal_features,
                         )
                         integrated_trends.append(integrated_trend)
-                
+
                 # Create ChangeAnalysis (order: required fields first, then optional)
                 change_analysis_result = ChangeAnalysis(
                     analysisWindow=analysis_window,
                     metrics=ChangeAnalysisMetrics(
                         totalChanges=len(clinical_changes),
-                        criticalChanges=len([c for c in clinical_changes if c.criticality == 'P0']),
-                        significantLabTrends=len([t for t in integrated_trends if t.significance]),
-                        stabilityScore=unified_analysis.summary.get('stability_score', 100.0)
+                        criticalChanges=len(
+                            [c for c in clinical_changes if c.criticality == "P0"]
+                        ),
+                        significantLabTrends=len(
+                            [t for t in integrated_trends if t.significance]
+                        ),
+                        stabilityScore=unified_analysis.summary.get(
+                            "stability_score", 100.0
+                        ),
                     ),
                     changes=clinical_changes,
-                    integratedTrends=integrated_trends
+                    integratedTrends=integrated_trends,
                 )
-                
+
                 # Generate change summary
                 change_summary_result = generate_change_summary(change_analysis_result)
-                
+
                 # Detect clinical patterns
                 clinical_patterns_result = detect_clinical_patterns(
-                    clinical_changes,
-                    integrated_trends
+                    clinical_changes, integrated_trends
                 )
         except Exception as e:
             # If change detection fails, log but don't break the main flow
             import traceback
+
             print(f"Warning: Clinical change detection failed: {e}")
             traceback.print_exc()
 
-    # ---------------- Final JSON-like dict ---------------- 
+    # ---------------- Final JSON-like dict ----------------
     result = {
         "subject_id": subject_id,
         "hadm_id": hadm_id,
-        "surgery_time": surgery_time.isoformat() if isinstance(surgery_time, datetime) else None,
+        "surgery_time": (
+            surgery_time.isoformat() if isinstance(surgery_time, datetime) else None
+        ),
         "last_updated": datetime.now().isoformat(),
         "calculated_risk_factors": calculated_risk_factors,
         "event_based_context": event_based_context,
@@ -1913,11 +2102,12 @@ def integrate_cardiac_and_pulmonary_risk(
         },
         "comorbidity_blocks": comorbidity_blocks,
     }
-    
+
     # Add consolidated comorbidity content summary
     triggered_with_content = [
-        b for b in comorbidity_blocks 
-        if b.get('triggered', False) and b.get('personalizedContent')
+        b
+        for b in comorbidity_blocks
+        if b.get("triggered", False) and b.get("personalizedContent")
     ]
     if triggered_with_content:
         result["comorbidity_content"] = {
@@ -1935,7 +2125,7 @@ def integrate_cardiac_and_pulmonary_risk(
             "totalBlocks": len(comorbidity_blocks),
             "triggeredCount": len(triggered_with_content),
         }
-    
+
     # Add merged content if multiple blocks triggered
     if merged_content:
         result["merged_recommendations"] = {
@@ -1943,10 +2133,14 @@ def integrate_cardiac_and_pulmonary_risk(
             "medication": [item.text for item in merged_content.medication],
             "consultation": [item.text for item in merged_content.consultation],
             "procedure": [item.text for item in merged_content.procedure],
-            "patientInstructions": [item.text for item in merged_content.patientInstructions],
+            "patientInstructions": [
+                item.text for item in merged_content.patientInstructions
+            ],
             "conflicts": [
                 {
-                    "conflictingItems": [item.text for item in conflict.conflictingItems],
+                    "conflictingItems": [
+                        item.text for item in conflict.conflictingItems
+                    ],
                     "resolution": conflict.resolution,
                     "mergedText": conflict.mergedText,
                     "rationale": conflict.rationale,
@@ -1956,7 +2150,7 @@ def integrate_cardiac_and_pulmonary_risk(
             "requiresClinicianReview": merged_content.requiresClinicianReview,
             "provenance": merged_content.provenance,
         }
-    
+
     # Add decision support recommendations
     if clinical_recommendations:
         result["clinical_recommendations"] = {
@@ -1994,7 +2188,7 @@ def integrate_cardiac_and_pulmonary_risk(
             ],
             "flags": clinical_recommendations.flags,
         }
-    
+
     # Add clinical change detection results
     if change_analysis_result:
         result["clinical_change_analysis"] = {
@@ -2006,33 +2200,89 @@ def integrate_cardiac_and_pulmonary_risk(
             "changeCounts": {
                 "total": change_analysis_result.metrics.totalChanges,
                 "critical": change_analysis_result.metrics.criticalChanges,
-                "important": len([c for c in change_analysis_result.changes if c.criticality == 'P1']),
-                "informational": len([c for c in change_analysis_result.changes if c.criticality == 'P2']),
+                "important": len(
+                    [c for c in change_analysis_result.changes if c.criticality == "P1"]
+                ),
+                "informational": len(
+                    [c for c in change_analysis_result.changes if c.criticality == "P2"]
+                ),
             },
             "stability": {
-                "stabilityScore": change_summary_result.stability.stabilityScore if change_summary_result else None,
-                "volatilityIndex": change_summary_result.stability.volatilityIndex if change_summary_result else None,
-                "trendStability": change_summary_result.stability.trendStability if change_summary_result else None,
-                "riskLevel": change_summary_result.stability.riskLevel if change_summary_result else None,
+                "stabilityScore": (
+                    change_summary_result.stability.stabilityScore
+                    if change_summary_result
+                    else None
+                ),
+                "volatilityIndex": (
+                    change_summary_result.stability.volatilityIndex
+                    if change_summary_result
+                    else None
+                ),
+                "trendStability": (
+                    change_summary_result.stability.trendStability
+                    if change_summary_result
+                    else None
+                ),
+                "riskLevel": (
+                    change_summary_result.stability.riskLevel
+                    if change_summary_result
+                    else None
+                ),
             },
             "changes": [
                 {
                     "timestamp": c.timestamp,
-                    "type": c.type.value if hasattr(c.type, 'value') else str(c.type),
-                    "category": c.category.value if hasattr(c.category, 'value') else str(c.category),
+                    "type": c.type.value if hasattr(c.type, "value") else str(c.type),
+                    "category": (
+                        c.category.value
+                        if hasattr(c.category, "value")
+                        else str(c.category)
+                    ),
                     "description": c.description,
                     "criticality": c.criticality,
-                    "quantitativeData": {
-                        "testName": c.quantitativeData.testName if c.quantitativeData else None,
-                        "previousValue": c.quantitativeData.previousValue if c.quantitativeData else None,
-                        "currentValue": c.quantitativeData.currentValue if c.quantitativeData else None,
-                        "unit": c.quantitativeData.unit if c.quantitativeData else None,
-                        "delta": c.quantitativeData.delta if c.quantitativeData else None,
-                        "percentChange": c.quantitativeData.percentChange if c.quantitativeData else None,
-                        "rateOfChange": c.quantitativeData.rateOfChange if c.quantitativeData else None,
-                    } if c.quantitativeData else None,
+                    "quantitativeData": (
+                        {
+                            "testName": (
+                                c.quantitativeData.testName
+                                if c.quantitativeData
+                                else None
+                            ),
+                            "previousValue": (
+                                c.quantitativeData.previousValue
+                                if c.quantitativeData
+                                else None
+                            ),
+                            "currentValue": (
+                                c.quantitativeData.currentValue
+                                if c.quantitativeData
+                                else None
+                            ),
+                            "unit": (
+                                c.quantitativeData.unit if c.quantitativeData else None
+                            ),
+                            "delta": (
+                                c.quantitativeData.delta if c.quantitativeData else None
+                            ),
+                            "percentChange": (
+                                c.quantitativeData.percentChange
+                                if c.quantitativeData
+                                else None
+                            ),
+                            "rateOfChange": (
+                                c.quantitativeData.rateOfChange
+                                if c.quantitativeData
+                                else None
+                            ),
+                        }
+                        if c.quantitativeData
+                        else None
+                    ),
                     "clinicalImpact": {
-                        "riskChange": c.clinicalImpact.riskChange.value if hasattr(c.clinicalImpact.riskChange, 'value') else str(c.clinicalImpact.riskChange),
+                        "riskChange": (
+                            c.clinicalImpact.riskChange.value
+                            if hasattr(c.clinicalImpact.riskChange, "value")
+                            else str(c.clinicalImpact.riskChange)
+                        ),
                         "affectsSurgicalPlanning": c.clinicalImpact.affectsSurgicalPlanning,
                         "requiresAction": c.clinicalImpact.requiresAction,
                     },
@@ -2047,24 +2297,56 @@ def integrate_cardiac_and_pulmonary_risk(
                     "confidence": t.confidence,
                     "significance": t.significance,
                     "dataSources": t.dataSources,
-                    "temporalFeatures": {
-                        "acceleration": t.temporalFeatures.acceleration if t.temporalFeatures else None,
-                        "volatility": t.temporalFeatures.volatility if t.temporalFeatures else None,
-                        "seasonality": t.temporalFeatures.seasonality if t.temporalFeatures else None,
-                        "outlierCount": t.temporalFeatures.outlierCount if t.temporalFeatures else None,
-                    } if t.temporalFeatures else None,
+                    "temporalFeatures": (
+                        {
+                            "acceleration": (
+                                t.temporalFeatures.acceleration
+                                if t.temporalFeatures
+                                else None
+                            ),
+                            "volatility": (
+                                t.temporalFeatures.volatility
+                                if t.temporalFeatures
+                                else None
+                            ),
+                            "seasonality": (
+                                t.temporalFeatures.seasonality
+                                if t.temporalFeatures
+                                else None
+                            ),
+                            "outlierCount": (
+                                t.temporalFeatures.outlierCount
+                                if t.temporalFeatures
+                                else None
+                            ),
+                        }
+                        if t.temporalFeatures
+                        else None
+                    ),
                     "trendDetails": t.trendDetails,
                     "clinicalImplications": t.clinicalImplications,
                     "monitoringRecommendations": t.monitoringRecommendations,
                 }
                 for t in change_analysis_result.integratedTrends
             ],
-            "summaries": {
-                "clinical": change_summary_result.summaries.get('clinical') if change_summary_result else None,
-                "export": change_summary_result.summaries.get('export') if change_summary_result else None,
-            } if change_summary_result else None,
+            "summaries": (
+                {
+                    "clinical": (
+                        change_summary_result.summaries.get("clinical")
+                        if change_summary_result
+                        else None
+                    ),
+                    "export": (
+                        change_summary_result.summaries.get("export")
+                        if change_summary_result
+                        else None
+                    ),
+                }
+                if change_summary_result
+                else None
+            ),
         }
-    
+
     # Add detected clinical patterns
     if clinical_patterns_result:
         result["clinical_patterns"] = [
@@ -2077,7 +2359,9 @@ def integrate_cardiac_and_pulmonary_risk(
                 "changes": [
                     {
                         "timestamp": c.timestamp,
-                        "type": c.type.value if hasattr(c.type, 'value') else str(c.type),
+                        "type": (
+                            c.type.value if hasattr(c.type, "value") else str(c.type)
+                        ),
                         "description": c.description,
                         "criticality": c.criticality,
                     }
@@ -2087,7 +2371,7 @@ def integrate_cardiac_and_pulmonary_risk(
             }
             for p in clinical_patterns_result
         ]
-    
+
     return result
 
 
@@ -2099,34 +2383,34 @@ def predict_preop_risk(
 ) -> Dict[str, Any]:
     """
     Pre-operative risk prediction function.
-    
+
     This function is specifically designed for PRE-OPERATIVE RISK ASSESSMENT,
     treating the planned surgery as a FUTURE event. All lab trends and temporal
     features are calculated using ONLY data BEFORE the planned_surgery_time.
-    
+
     Key differences from integrate_cardiac_and_pulmonary_risk():
     - planned_surgery_time is REQUIRED (not optional)
     - All temporal windows are anchored to planned_surgery_time
     - Labs during or after planned_surgery_time are EXCLUDED
     - Report is labeled as "pre-operative prediction"
-    
+
     Args:
         subject_id: Patient SUBJECT_ID
         hadm_id: Hospital admission ID for the planned surgery
         planned_surgery_time: Planned/expected surgery time (datetime)
                              This should be a FUTURE time relative to admission
         data_dir: Directory containing MIMIC-III CSV files
-        
+
     Returns:
         Integrated risk assessment JSON with:
         - assessment_type: "pre_operative_prediction"
         - planned_surgery_time: ISO-8601 string
         - All risk scores, lab trends, and recommendations based on pre-op data only
         - risk_confidence: Overall confidence score (0-1)
-        
+
     Example:
         from datetime import datetime
-        
+
         planned_surgery = datetime(2149, 12, 20, 10, 0, 0)  # Future surgery time
         report = predict_preop_risk(
             subject_id=249,
@@ -2141,7 +2425,7 @@ def predict_preop_risk(
             "planned_surgery_time is required for pre-operative prediction. "
             "This should be the expected/planned surgery time."
         )
-    
+
     # Get admission time for validation (optional check)
     try:
         admissions_df = pd.read_csv(
@@ -2153,16 +2437,17 @@ def predict_preop_risk(
             if planned_surgery_time < admittime:
                 # Warning: surgery time is before admission (might be data issue)
                 import warnings
+
                 warnings.warn(
                     f"planned_surgery_time ({planned_surgery_time}) is before "
                     f"admission time ({admittime}). This may indicate a data issue. "
                     f"Proceeding with assessment using planned_surgery_time as anchor.",
-                    UserWarning
+                    UserWarning,
                 )
     except Exception:
         # If we can't validate, proceed anyway
         pass
-    
+
     # Call the main integration function with the planned surgery time
     report = integrate_cardiac_and_pulmonary_risk(
         subject_id=subject_id,
@@ -2170,7 +2455,7 @@ def predict_preop_risk(
         data_dir=data_dir,
         surgery_time=planned_surgery_time,  # Always use planned_surgery_time as anchor
     )
-    
+
     # Add pre-operative prediction metadata
     report["assessment_type"] = "pre_operative_prediction"
     report["planned_surgery_time"] = (
@@ -2178,7 +2463,7 @@ def predict_preop_risk(
         if isinstance(planned_surgery_time, datetime)
         else str(planned_surgery_time)
     )
-    
+
     return report
 
 
@@ -2198,5 +2483,3 @@ if __name__ == "__main__":
     print("PRE-OPERATIVE RISK PREDICTION")
     print("=" * 80)
     pprint(preop_report)
-
-
